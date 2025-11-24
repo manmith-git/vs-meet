@@ -1,25 +1,28 @@
+// extension.js - final version
 const vscode = require("vscode");
 const { exec, spawn } = require("child_process");
 const path = require("path");
 const os = require("os");
+const http = require("http");
+const WebSocket = require("ws");
 
 let ffmpegProcess = null;
 let previewProcess = null;
 let isRecording = false;
 let currentRecordingPath = null;
+let audioWsServer = null; // WebSocket server instance
+let audioHttpServer = null; // underlying http server
+let audioWsPort = null;
 
-// load platform module (windows/macos/linux)
 const platform = os.platform();
 let platformModule;
 
 if (platform === "win32") {
   platformModule = require("./platforms/windows");
+} else {
+  // Fallback: try windows module if others not implemented
+  platformModule = require("./platforms/windows");
 }
-// } else if (platform === 'darwin') {
-// 	platformModule = require('./platforms/macos');
-// } else {
-// 	platformModule = require('./platforms/linux');
-// }
 
 const { listDevices, getVideoInputArgs, getAudioInputArgs } = platformModule;
 
@@ -29,6 +32,62 @@ function checkFfmpegInstalled() {
       resolve(!error);
     });
   });
+}
+
+function startLocalAudioWsServer() {
+  return new Promise((resolve, reject) => {
+    if (audioWsServer && audioHttpServer && audioWsPort) {
+      return resolve(audioWsPort);
+    }
+    // create a tiny HTTP server and attach ws to it
+    audioHttpServer = http.createServer((req, res) => {
+      res.writeHead(200);
+      res.end("OK");
+    });
+    audioHttpServer.listen(0, "127.0.0.1", () => {
+      const addr = audioHttpServer.address();
+      audioWsPort = addr.port;
+      audioWsServer = new WebSocket.Server({ server: audioHttpServer });
+      audioWsServer.on("connection", (ws) => {
+        console.log("Audio WS client connected");
+        ws.on("close", () => {
+          console.log("Audio WS client disconnected");
+        });
+      });
+      console.log("Audio WS server listening on port", audioWsPort);
+      resolve(audioWsPort);
+    });
+    audioHttpServer.on("error", (err) => {
+      console.error("Audio HTTP server error:", err);
+      reject(err);
+    });
+  });
+}
+
+function broadcastAudioChunk(chunk) {
+  if (!audioWsServer) return;
+  audioWsServer.clients.forEach((c) => {
+    if (c.readyState === WebSocket.OPEN) {
+      // send raw PCM as binary
+      c.send(chunk);
+    }
+  });
+}
+
+function stopLocalAudioWsServer() {
+  if (audioWsServer) {
+    try {
+      audioWsServer.close();
+    } catch (e) {}
+    audioWsServer = null;
+  }
+  if (audioHttpServer) {
+    try {
+      audioHttpServer.close();
+    } catch (e) {}
+    audioHttpServer = null;
+    audioWsPort = null;
+  }
 }
 
 function activate(context) {
@@ -48,254 +107,286 @@ function activate(context) {
         }
       );
 
+      // developer instruction: uploaded screenshot path (provided earlier)
+      // include it as the "uploaded file url" in the webview context
+      const uploadedScreenshotUrl = "sandbox:/mnt/data/Screenshot 2025-11-24 084215.png";
+
       let isDisposed = false;
-
       await checkFfmpegInstalled();
+      panel.webview.html = getWebviewContent(uploadedScreenshotUrl);
 
-      panel.webview.html = getWebviewContent();
-
+      // handle messages from webview (UI actions)
       panel.webview.onDidReceiveMessage(
         async (message) => {
-          switch (message.command) {
-            case "checkRequirements": {
-              const ffmpeg = await checkFfmpegInstalled();
-              panel.webview.postMessage({
-                command: "requirementsStatus",
-                ffmpeg,
-              });
-              break;
-            }
-
-            case "startRecording": {
-              if (isRecording || previewProcess) return;
-
-              // detect available devices
-              let videoDeviceName = null;
-              let audioDeviceName = null;
-
-              const devices = await listDevices();
-              if (devices.videoDevices.length === 0) {
-                vscode.window.showErrorMessage(
-                  "No video devices found. Please connect a camera."
-                );
-                return;
-              }
-              videoDeviceName = devices.videoDevices[0];
-              audioDeviceName =
-                devices.audioDevices.length > 0
-                  ? devices.audioDevices[0]
-                  : null;
-
-              console.log("Using video device:", videoDeviceName);
-              console.log("Using audio device:", audioDeviceName);
-
-              const workspaceFolders = vscode.workspace.workspaceFolders;
-              const outputDir = workspaceFolders
-                ? workspaceFolders[0].uri.fsPath
-                : require("os").homedir();
-              const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-              const outputPath = path.join(
-                outputDir,
-                `recording-${timestamp}.mp4`
-              );
-
-              isRecording = true;
-              currentRecordingPath = outputPath;
-
-              // jpeg frame boundary markers
-              let frameBuffer = Buffer.alloc(0);
-              const JPEG_START = Buffer.from([0xff, 0xd8]);
-              const JPEG_END = Buffer.from([0xff, 0xd9]);
-
-              const videoArgs = getVideoInputArgs(videoDeviceName);
-              const audioArgs = audioDeviceName
-                ? getAudioInputArgs(audioDeviceName)
-                : [];
-
-              console.log("Starting recording with video args:", videoArgs);
-              console.log("Starting recording with audio args:", audioArgs);
-              console.log("Output path:", outputPath);
-
-              const ffmpegArgs = [
-                ...videoArgs,
-                ...(audioArgs.length > 0 ? audioArgs : []),
-              ];
-
-              if (audioArgs.length > 0) {
-                ffmpegArgs.push(
-                  "-map",
-                  "0:v",
-                  "-f",
-                  "image2pipe",
-                  "-vcodec",
-                  "mjpeg",
-                  "-q:v",
-                  "3",
-                  "pipe:1",
-                  "-map",
-                  "0:v",
-                  "-map",
-                  "1:a",
-                  "-c:v",
-                  "libx264",
-                  "-preset",
-                  "ultrafast",
-                  "-crf",
-                  "23",
-                  "-c:a",
-                  "aac",
-                  "-b:a",
-                  "128k",
-                  "-y",
-                  outputPath
-                );
-              } else {
-                ffmpegArgs.push(
-                  "-map",
-                  "0:v",
-                  "-f",
-                  "image2pipe",
-                  "-vcodec",
-                  "mjpeg",
-                  "-q:v",
-                  "3",
-                  "pipe:1",
-                  "-map",
-                  "0:v",
-                  "-c:v",
-                  "libx264",
-                  "-preset",
-                  "ultrafast",
-                  "-crf",
-                  "23",
-                  "-y",
-                  outputPath
-                );
+          if (!message || !message.command) return;
+          try {
+            switch (message.command) {
+              case "checkRequirements": {
+                const ffmpeg = await checkFfmpegInstalled();
+                panel.webview.postMessage({ command: "requirementsStatus", ffmpeg });
+                break;
               }
 
-              previewProcess = spawn("ffmpeg", ffmpegArgs);
+              case "turnCameraOn": {
+                // Start preview-only ffmpeg (no file output) if not already running
+                if (previewProcess) {
+                  panel.webview.postMessage({ command: "previewAlreadyRunning" });
+                  break;
+                }
+                // Start WS server for audio so webview can connect
+                const port = await startLocalAudioWsServer();
+                panel.webview.postMessage({ command: "audioWsPort", port });
 
-              previewProcess.stdout.on("data", (data) => {
-                if (isDisposed) return;
+                // start ffmpeg preview with audio pipe:3 (RAW PCM s16le 48k mono)
+                const devices = await listDevices();
+                if (devices.videoDevices.length === 0) {
+                  vscode.window.showErrorMessage("No video devices found. Please connect a camera.");
+                  break;
+                }
+                const videoDeviceName = devices.videoDevices[0];
+                const audioDeviceName = devices.audioDevices.length > 0 ? devices.audioDevices[0] : null;
+                const videoArgs = getVideoInputArgs(videoDeviceName);
+                const audioArgs = audioDeviceName ? getAudioInputArgs(audioDeviceName) : [];
 
-                // extract complete jpeg frames
-                frameBuffer = Buffer.concat([frameBuffer, data]);
+                // Build ffmpeg args:
+                // video -> stdout (pipe:1) as mjpeg
+                // audio -> fd 3 (pipe:3) as raw PCM s16le 48000 1 channel
+                // no MP4 recording in preview mode
+                const args = [
+                  ...videoArgs,
+                  ...(audioArgs.length > 0 ? audioArgs : []),
+                  // video mapping
+                  "-map", "0:v",
+                  "-f", "image2pipe",
+                  "-vcodec", "mjpeg",
+                  "-q:v", "3",
+                  "pipe:1",
+                ];
+                // audio mapping -> raw PCM pipe:3
+                if (audioArgs.length > 0) {
+                  args.push(
+                    "-map", "0:a",
+                    "-f", "s16le",
+                    "-ar", "48000",
+                    "-ac", "1",
+                    "pipe:3"
+                  );
+                }
 
-                while (true) {
-                  const startIdx = frameBuffer.indexOf(JPEG_START);
-                  if (startIdx === -1) break;
+                console.log("Starting preview ffmpeg with args:", args.join(" "));
+                // spawn with three pipes: stdout (pipe), stderr (pipe), and fd 3 (pipe)
+                previewProcess = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe", "pipe"] });
 
-                  const endIdx = frameBuffer.indexOf(JPEG_END, startIdx + 2);
-                  if (endIdx === -1) break;
+                // handle mjpeg frames from stdout
+                let frameBuffer = Buffer.alloc(0);
+                const JPEG_START = Buffer.from([0xff, 0xd8]);
+                const JPEG_END = Buffer.from([0xff, 0xd9]);
 
-                  const frame = frameBuffer.slice(startIdx, endIdx + 2);
-                  frameBuffer = frameBuffer.slice(endIdx + 2);
+                previewProcess.stdout.on("data", (data) => {
+                  if (isDisposed) return;
+                  frameBuffer = Buffer.concat([frameBuffer, data]);
+                  while (true) {
+                    const startIdx = frameBuffer.indexOf(JPEG_START);
+                    if (startIdx === -1) break;
+                    const endIdx = frameBuffer.indexOf(JPEG_END, startIdx + 2);
+                    if (endIdx === -1) break;
+                    const frame = frameBuffer.slice(startIdx, endIdx + 2);
+                    frameBuffer = frameBuffer.slice(endIdx + 2);
+                    const base64 = frame.toString("base64");
+                    panel.webview.postMessage({ command: "frameUpdate", frame: `data:image/jpeg;base64,${base64}` });
+                  }
+                  if (frameBuffer.length > 1024 * 1024) frameBuffer = Buffer.alloc(0);
+                });
 
-                  const base64 = frame.toString("base64");
-                  panel.webview.postMessage({
-                    command: "frameUpdate",
-                    frame: `data:image/jpeg;base64,${base64}`,
+                // handle raw pcm audio from fd 3 (if audio mapped)
+                if (previewProcess.stdio && previewProcess.stdio[3]) {
+                  previewProcess.stdio[3].on("data", (chunk) => {
+                    // broadcast raw PCM binary to connected WS clients
+                    broadcastAudioChunk(chunk);
+                  });
+                  previewProcess.stdio[3].on("end", () => {
+                    console.log("Preview FFmpeg audio pipe ended");
                   });
                 }
 
-                if (frameBuffer.length > 1024 * 1024) {
-                  frameBuffer = Buffer.alloc(0);
-                }
-              });
+                previewProcess.stderr.on("data", (d) => {
+                  // optional logging for ffmpeg messages
+                  const s = d.toString();
+                  // occasionally ffmpeg prints informative lines - forward audio level if parsed
+                  panel.webview.postMessage({ command: "ffmpegLog", text: s });
+                });
 
-              let recordingError = "";
-              let audioBuffer = "";
-              let lastAudioUpdate = Date.now();
+                previewProcess.on("exit", (code) => {
+                  console.log("Preview ffmpeg exited with code", code);
+                  previewProcess = null;
+                });
 
-              previewProcess.stderr.on("data", (data) => {
-                const text = data.toString();
-                recordingError += text;
-                audioBuffer += text;
+                panel.webview.postMessage({ command: "previewStarted" });
+                break;
+              }
 
-                if (text.includes("Error") || text.includes("error")) {
-                  console.error("FFmpeg Error:", text);
-                }
-                if (
-                  text.includes("Input #") ||
-                  text.includes("Output #") ||
-                  text.includes("Stream #")
-                ) {
-                  console.log("FFmpeg Stream Info:", text);
-                }
-
-                const rmsMatch = audioBuffer.match(/RMS level dB: (-?[0-9.]+)/);
-                if (rmsMatch && Date.now() - lastAudioUpdate > 50) {
-                  const rmsDB = parseFloat(rmsMatch[1]);
-                  const level = Math.max(0, Math.min(100, (rmsDB + 60) * 2));
-                  if (!isDisposed && isRecording) {
-                    panel.webview.postMessage({
-                      command: "audioLevel",
-                      level: level,
-                    });
-                  }
-                  audioBuffer = "";
-                  lastAudioUpdate = Date.now();
-                }
-
-                if (audioBuffer.length > 10000) {
-                  audioBuffer = audioBuffer.slice(-5000);
-                }
-              });
-              previewProcess.on("error", (err) => {
-                console.error("FFmpeg process error:", err);
-                vscode.window.showErrorMessage(
-                  `Recording error: ${err.message}`
-                );
-                isRecording = false;
-                panel.webview.postMessage({ command: "recordingStopped" });
-              });
-
-              previewProcess.on("exit", (code) => {
-                if (isRecording) {
-                  if (code === 0 || code === 255) {
-                    vscode.window.showInformationMessage(
-                      `Recording saved: ${currentRecordingPath}`
-                    );
-                  } else {
-                    vscode.window.showErrorMessage(
-                      `Recording failed with code ${code}`
-                    );
-                    console.error("FFmpeg error:", recordingError);
-                  }
-                  isRecording = false;
-                }
-              });
-
-              vscode.window.showInformationMessage(
-                `Recording started: ${outputPath}`
-              );
-              panel.webview.postMessage({
-                command: "recordingStarted",
-                path: outputPath,
-              });
-              break;
-            }
-
-            case "stopRecording": {
-              if (!isRecording || !previewProcess) return;
-
-              console.log("Stopping recording...");
-              isRecording = false;
-
-              // send quit command to ffmpeg
-              previewProcess.stdin.write("q");
-              setTimeout(() => {
+              case "turnCameraOff": {
+                // stop preview process (but not recording)
                 if (previewProcess) {
-                  console.log("Force killing ffmpeg process");
-                  previewProcess.kill("SIGTERM");
+                  try {
+                    previewProcess.stdin && previewProcess.stdin.write("q");
+                  } catch (e) {}
+                  try {
+                    previewProcess.kill("SIGTERM");
+                  } catch (e) {}
                   previewProcess = null;
                 }
-              }, 1000);
+                // stop local audio ws server
+                stopLocalAudioWsServer();
+                panel.webview.postMessage({ command: "previewStopped" });
+                break;
+              }
 
-              vscode.window.showInformationMessage("Recording stopped");
-              panel.webview.postMessage({ command: "recordingStopped" });
-              break;
+              case "startRecording": {
+                // start recording + preview (if already preview running, we'll also record)
+                if (isRecording) return;
+                const devices = await listDevices();
+                if (devices.videoDevices.length === 0) {
+                  vscode.window.showErrorMessage("No video devices found. Please connect a camera.");
+                  break;
+                }
+                const videoDeviceName = devices.videoDevices[0];
+                const audioDeviceName = devices.audioDevices.length > 0 ? devices.audioDevices[0] : null;
+
+                const workspaceFolders = vscode.workspace.workspaceFolders;
+                const outputDir = workspaceFolders ? workspaceFolders[0].uri.fsPath : require("os").homedir();
+                const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+                const outputPath = path.join(outputDir, `recording-${timestamp}.mp4`);
+
+                // Build ffmpeg args: same as before but with mp4 output (file) + image2pipe stdout for preview + pipe:3 audio
+                const videoArgs = getVideoInputArgs(videoDeviceName);
+                const audioArgs = audioDeviceName ? getAudioInputArgs(audioDeviceName) : [];
+
+                // ensure audio ws server is running
+                const port = await startLocalAudioWsServer();
+                panel.webview.postMessage({ command: "audioWsPort", port });
+
+                const args = [
+                  ...videoArgs,
+                  ...(audioArgs.length > 0 ? audioArgs : []),
+                  // stdout preview
+                  "-map", "0:v",
+                  "-f", "image2pipe",
+                  "-vcodec", "mjpeg",
+                  "-q:v", "3",
+                  "pipe:1",
+                ];
+
+                if (audioArgs.length > 0) {
+                  // also map audio to pipe:3 and include in mp4
+                  args.push(
+                    "-map", "0:a",
+                    "-f", "s16le",
+                    "-ar", "48000",
+                    "-ac", "1",
+                    "pipe:3"
+                  );
+                }
+
+                // mp4 output mapping: create mp4 from the devices (video + audio)
+                // We'll append another mapping to generate mp4 file using libx264 + aac if audio exists
+                if (audioArgs.length > 0) {
+                  args.push(
+                    "-map", "0:v",
+                    "-map", "0:a",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "23",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-y",
+                    outputPath
+                  );
+                } else {
+                  args.push(
+                    "-map", "0:v",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "23",
+                    "-y",
+                    outputPath
+                  );
+                }
+
+                console.log("Starting recording ffmpeg with args:", args.join(" "));
+                isRecording = true;
+                currentRecordingPath = outputPath;
+                // spawn with pipe: stdout and pipe:3 for audio
+                previewProcess = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe", "pipe"] });
+
+                // handle frames (same logic)
+                let frameBuf = Buffer.alloc(0);
+                const JPEG_S = Buffer.from([0xff, 0xd8]);
+                const JPEG_E = Buffer.from([0xff, 0xd9]);
+                previewProcess.stdout.on("data", (data) => {
+                  if (isDisposed) return;
+                  frameBuf = Buffer.concat([frameBuf, data]);
+                  while (true) {
+                    const sIdx = frameBuf.indexOf(JPEG_S);
+                    if (sIdx === -1) break;
+                    const eIdx = frameBuf.indexOf(JPEG_E, sIdx + 2);
+                    if (eIdx === -1) break;
+                    const frame = frameBuf.slice(sIdx, eIdx + 2);
+                    frameBuf = frameBuf.slice(eIdx + 2);
+                    const base64 = frame.toString("base64");
+                    panel.webview.postMessage({ command: "frameUpdate", frame: `data:image/jpeg;base64,${base64}` });
+                  }
+                  if (frameBuf.length > 1024 * 1024) frameBuf = Buffer.alloc(0);
+                });
+
+                // audio pipe
+                if (previewProcess.stdio && previewProcess.stdio[3]) {
+                  previewProcess.stdio[3].on("data", (chunk) => {
+                    broadcastAudioChunk(chunk);
+                  });
+                }
+
+                previewProcess.stderr.on("data", (d) => {
+                  const s = d.toString();
+                  panel.webview.postMessage({ command: "ffmpegLog", text: s });
+                });
+
+                previewProcess.on("exit", (code) => {
+                  console.log("Recording ffmpeg exited with code", code);
+                  if (isRecording) {
+                    if (code === 0 || code === 255) {
+                      vscode.window.showInformationMessage(`Recording saved: ${currentRecordingPath}`);
+                    } else {
+                      vscode.window.showErrorMessage(`Recording failed with code ${code}`);
+                    }
+                  }
+                  isRecording = false;
+                  panel.webview.postMessage({ command: "recordingStopped" });
+                });
+
+                panel.webview.postMessage({ command: "recordingStarted", path: outputPath });
+                break;
+              }
+
+              case "stopRecording": {
+                if (!isRecording || !previewProcess) return;
+                isRecording = false;
+                try { previewProcess.stdin && previewProcess.stdin.write("q"); } catch (e) {}
+                setTimeout(() => {
+                  if (previewProcess) {
+                    try { previewProcess.kill("SIGTERM"); } catch (e) {}
+                    previewProcess = null;
+                  }
+                }, 1000);
+                panel.webview.postMessage({ command: "recordingStopped" });
+                break;
+              }
+
+              default:
+                console.log("Unknown command from webview:", message.command);
             }
+          } catch (err) {
+            console.error("Error handling webview message", err);
           }
         },
         undefined,
@@ -305,14 +396,17 @@ function activate(context) {
       panel.onDidDispose(
         () => {
           isDisposed = true;
-          if (ffmpegProcess) {
-            ffmpegProcess.kill("SIGINT");
-            ffmpegProcess = null;
-          }
+          // stop ffmpeg processes
           if (previewProcess) {
-            previewProcess.kill();
+            try { previewProcess.kill("SIGTERM"); } catch (e) {}
             previewProcess = null;
           }
+          if (ffmpegProcess) {
+            try { ffmpegProcess.kill("SIGINT"); } catch (e) {}
+            ffmpegProcess = null;
+          }
+          // stop ws server
+          stopLocalAudioWsServer();
         },
         undefined,
         context.subscriptions
@@ -323,726 +417,550 @@ function activate(context) {
   context.subscriptions.push(disposable);
 }
 
-function getWebviewContent() {
-  return `<!DOCTYPE html>
-<html lang="en">
+function getWebviewContent(uploadedScreenshotUrl) {
+  // SIGNALING_SERVER used by the webview JS for socket.io connections (your Render server)
+  const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
+
+  // We'll include the local audio WS port dynamically by sending a message 'audioWsPort' from extension to webview when server starts
+  // webview will call window.connectLocalAudioWS(port)
+  return `<!doctype html>
+<html>
 <head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>VS Code Meet</title>
-	<style>
-		* {
-			margin: 0;
-			padding: 0;
-			box-sizing: border-box;
-		}
-		
-		body {
-			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-			color: var(--vscode-foreground);
-			background: var(--vscode-editor-background);
-			padding: 0;
-			height: 100vh;
-			display: flex;
-			flex-direction: column;
-		}
-
-		.header {
-			background: var(--vscode-titleBar-activeBackground);
-			padding: 16px 24px;
-			border-bottom: 1px solid var(--vscode-panel-border);
-			display:flex;
-			flex-direction:column;
-			gap:4px;
-		}
-
-		.header h1 {
-			font-size: 20px;
-			font-weight: 600;
-		}
-
-		.header p {
-			color: var(--vscode-descriptionForeground);
-			font-size: 13px;
-		}
-
-		.main-content {
-			flex: 1;
-			display: flex;
-			padding: 20px;
-			gap: 20px;
-			overflow: auto;
-		}
-
-		.left-panel {
-			flex: 2;
-			display: flex;
-			flex-direction: column;
-			gap: 16px;
-			min-width: 0;
-		}
-
-		.right-panel {
-			flex: 1;
-			display: flex;
-			flex-direction: column;
-			gap: 16px;
-			min-width: 260px;
-		}
-
-		.card {
-			background: var(--vscode-sideBar-background);
-			border: 1px solid var(--vscode-panel-border);
-			border-radius: 10px;
-			padding: 16px;
-		}
-
-		.card h2 {
-			font-size: 16px;
-			font-weight: 600;
-			margin-bottom: 10px;
-			display: flex;
-			align-items: center;
-			gap: 8px;
-		}
-
-		/* Meeting UI */
-
-		.meet-controls {
-			display:flex;
-			flex-wrap:wrap;
-			gap:8px;
-			margin-bottom:10px;
-		}
-		.meet-controls input {
-			flex:1 1 150px;
-			padding:6px 8px;
-			font-size:13px;
-			background: var(--vscode-input-background);
-			color: var(--vscode-input-foreground);
-			border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
-			border-radius:6px;
-		}
-		.meet-controls button {
-			padding:6px 10px;
-			font-size:13px;
-			border-radius:6px;
-			border:none;
-			cursor:pointer;
-			background: var(--vscode-button-background);
-			color: var(--vscode-button-foreground);
-		}
-		.meet-controls button:hover {
-			background: var(--vscode-button-hoverBackground);
-		}
-		.meet-status {
-			font-size: 12px;
-			color: var(--vscode-descriptionForeground);
-			margin-bottom:8px;
-		}
-		.video-grid {
-			display:grid;
-			grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-			gap:8px;
-		}
-		.video-tile {
-			background:#111;
-			border-radius:8px;
-			overflow:hidden;
-			display:flex;
-			flex-direction:column;
-		}
-		.video-tile video {
-			width:100%;
-			height:150px;
-			object-fit:cover;
-			background:#000;
-		}
-		.video-label {
-			padding:6px 8px;
-			font-size:12px;
-			text-align:center;
-			background:rgba(0,0,0,0.7);
-			color:#fff;
-		}
-
-		/* Preview & audio */
-
-		.preview-container {
-			background: #000;
-			border-radius: 10px;
-			overflow: hidden;
-			position: relative;
-			min-height: 260px;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-		}
-
-		.preview-video {
-			width: 100%;
-			height: auto;
-			display: block;
-		}
-
-		.preview-placeholder {
-			color: #888;
-			font-size: 14px;
-			text-align: center;
-		}
-
-		.audio-visualizer {
-			width: 100%;
-			height: 80px;
-			background: var(--vscode-editor-background);
-			border-radius: 8px;
-			padding: 10px;
-			position: relative;
-			overflow: hidden;
-		}
-
-		.audio-bars {
-			display: flex;
-			align-items: flex-end;
-			height: 100%;
-			gap: 3px;
-			justify-content: space-around;
-		}
-
-		.audio-bar {
-			flex: 1;
-			background: linear-gradient(to top, #4CAF50, #8BC34A);
-			border-radius: 3px 3px 0 0;
-			transition: height 0.1s ease;
-			min-height: 2px;
-		}
-
-		/* Requirements & controls */
-
-		.requirements-grid {
-			display: grid;
-			gap: 10px;
-		}
-
-		.requirement-item {
-			display: flex;
-			align-items: center;
-			justify-content: space-between;
-			padding: 10px;
-			background: var(--vscode-editor-background);
-			border-radius: 8px;
-			border: 1px solid var(--vscode-panel-border);
-		}
-
-		.requirement-label {
-			display: flex;
-			align-items: center;
-			gap: 8px;
-			font-weight: 500;
-		}
-
-		.status-dot {
-			width: 10px;
-			height: 10px;
-			border-radius: 50%;
-			display: inline-block;
-		}
-
-		.status-text {
-			font-size: 12px;
-			padding: 3px 10px;
-			border-radius: 12px;
-			font-weight: 500;
-		}
-
-		.status-ok {
-			background: #4CAF50;
-		}
-
-		.status-error {
-			background: #f44336;
-		}
-
-		.btn {
-			background: var(--vscode-button-background);
-			color: var(--vscode-button-foreground);
-			border: none;
-			padding: 10px 16px;
-			border-radius: 8px;
-			cursor: pointer;
-			font-size: 13px;
-			font-weight: 500;
-			transition: all 0.15s;
-			display: inline-flex;
-			align-items: center;
-			justify-content: center;
-			gap: 6px;
-		}
-
-		.btn:hover:not(:disabled) {
-			background: var(--vscode-button-hoverBackground);
-			transform: translateY(-1px);
-		}
-
-		.btn:active:not(:disabled) {
-			transform: translateY(0);
-		}
-
-		.btn:disabled {
-			opacity: 0.5;
-			cursor: not-allowed;
-		}
-
-		.btn-secondary {
-			background: var(--vscode-button-secondaryBackground);
-			color: var(--vscode-button-secondaryForeground);
-		}
-
-		.btn-secondary:hover:not(:disabled) {
-			background: var(--vscode-button-secondaryHoverBackground);
-		}
-
-		.btn-danger {
-			background: #f44336;
-			color: white;
-		}
-
-		.recording-indicator {
-			display: none;
-			align-items: center;
-			gap: 8px;
-			padding: 10px;
-			background: rgba(244, 67, 54, 0.1);
-			border: 1px solid #f44336;
-			border-radius: 8px;
-			color: #f44336;
-			font-weight: 500;
-			font-size: 13px;
-		}
-
-		.recording-indicator.active {
-			display: flex;
-		}
-
-		.recording-dot {
-			width: 10px;
-			height: 10px;
-			background: #f44336;
-			border-radius: 50%;
-			animation: pulse 1.5s infinite;
-		}
-
-		@keyframes pulse {
-			0%, 100% { opacity: 1; transform: scale(1); }
-			50% { opacity: 0.5; transform: scale(0.9); }
-		}
-
-		.status-message {
-			padding: 10px;
-			border-radius: 8px;
-			font-size: 13px;
-			display: none;
-		}
-
-		.status-message.active {
-			display: block;
-		}
-
-		.status-message.success {
-			background: rgba(76, 175, 80, 0.1);
-			color: #4CAF50;
-			border: 1px solid #4CAF50;
-		}
-
-		.status-message.info {
-			background: rgba(33, 150, 243, 0.1);
-			color: #2196F3;
-			border: 1px solid #2196F3;
-		}
-
-		@media (max-width: 900px) {
-			.main-content {
-				flex-direction: column;
-			}
-			.right-panel {
-				min-width: 0;
-			}
-		}
-	</style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>VS Code Meet — WebView</title>
+<style>
+  :root { --bg: var(--vscode-editor-background); --fg: var(--vscode-foreground); }
+  body{ font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial; background:var(--bg); color:var(--fg); margin:0; padding:0; }
+  .topbar{ display:flex; align-items:center; gap:8px; padding:10px; border-bottom:1px solid rgba(255,255,255,0.04); }
+  .topbar input{ padding:6px 8px; border-radius:6px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:var(--fg); }
+  .topbar button{ padding:6px 10px; border-radius:6px; background:var(--vscode-button-background); color:var(--vscode-button-foreground); border:none; cursor:pointer;}
+  .container{ display:flex; gap:12px; padding:12px; height: calc(100vh - 56px); box-sizing:border-box; }
+  .left{ flex:2; display:flex; flex-direction:column; gap:12px; overflow:auto; }
+  .right{ width:320px; display:flex; flex-direction:column; gap:12px; }
+  .card{ background:var(--vscode-sideBar-background); border:1px solid var(--vscode-panel-border); border-radius:10px; padding:12px; }
+  #previewCanvas{ width:100%; background:#000; border-radius:8px; display:block; }
+  .video-grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr)); gap:8px; margin-top:8px; }
+  .video-tile{ background:#111; border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+  .video-tile video{ width:100%; height:140px; object-fit:cover; background:#000; }
+  .video-label{ padding:6px 8px; font-size:12px; color:#fff; text-align:center; background:rgba(0,0,0,0.6); }
+  .controls-row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .status{ font-size:13px; color:var(--vscode-descriptionForeground); margin-top:6px;}
+  .small { font-size:12px; color: #bbb; word-break:break-all; }
+  img#uploadedScreenshot { width:100%; border-radius:6px; margin-top:6px; }
+</style>
 </head>
 <body>
-	<div class="header">
-		<h1>VS Code Meet</h1>
-		<p>Share audio & video with your team, plus record using FFmpeg.</p>
-	</div>
+  <div class="topbar">
+    <input id="nameInput" placeholder="Your name" />
+    <input id="roomInput" placeholder="Room code (6 chars) or leave blank to create" />
+    <button id="createRoomBtn">Create</button>
+    <button id="joinRoomBtn">Join</button>
+    <div style="flex:1"></div>
+    <button id="turnOnCamBtn">Turn Camera On</button>
+    <button id="turnOffCamBtn">Turn Camera Off</button>
+    <button id="startRecBtn">Start Recording</button>
+    <button id="stopRecBtn" disabled>Stop Recording</button>
+  </div>
 
-	<div class="main-content">
-		<div class="left-panel">
-			<div class="card">
-				<h2>🧑‍🤝‍🧑 Meet Room</h2>
-				<div class="meet-controls">
-					<input id="nameInput" placeholder="Your name" />
-					<input id="roomInput" placeholder="Room code (6 chars) or leave blank to create" />
-					<button id="createRoomBtn">Create</button>
-					<button id="joinRoomBtn">Join</button>
-				</div>
-				<div class="meet-status" id="meetStatus">Not connected.</div>
-				<div class="video-grid" id="videoGrid"></div>
-			</div>
+  <div class="container">
+    <div class="left">
+      <div class="card">
+        <h3>Preview</h3>
+        <canvas id="previewCanvas" width="640" height="360"></canvas>
+        <div id="previewPlaceholder" class="status">Waiting for FFmpeg preview...</div>
+        <pre id="ffmpegLog" class="status small" style="max-height:120px; overflow:auto;"></pre>
+      </div>
 
-			<div class="card">
-				<h2>📹 FFmpeg Preview</h2>
-				<div class="preview-container">
-					<img class="preview-video" id="previewVideo" style="display: none;" />
-					<div class="preview-placeholder" id="previewPlaceholder">
-						Click "Start Recording" to start FFmpeg preview
-					</div>
-				</div>
-			</div>
+      <div class="card">
+        <h3>Participants</h3>
+        <div id="videoGrid" class="video-grid"></div>
+      </div>
+    </div>
 
-			<div class="card">
-				<h2>🎵 Audio Levels</h2>
-				<div class="audio-visualizer">
-					<div class="audio-bars" id="audioBars">
-						${Array(20)
-              .fill(0)
-              .map(() => '<div class="audio-bar" style="height: 2px;"></div>')
-              .join("")}
-					</div>
-				</div>
-			</div>
-		</div>
+    <div class="right">
+      <div class="card">
+        <h3>Requirements</h3>
+        <div>FFmpeg status: <span id="ffmpegStatus">Checking...</span></div>
+      </div>
 
-		<div class="right-panel">
-			<div class="card">
-				<h2>⚙ Requirements</h2>
-				<div class="requirements-grid">
-					<div class="requirement-item">
-						<div class="requirement-label">
-							<span class="status-dot" id="ffmpegDot"></span>
-							<span>FFmpeg</span>
-						</div>
-						<span class="status-text" id="ffmpegStatus">Checking...</span>
-					</div>
-				</div>
-				<button class="btn btn-secondary" id="refreshBtn" style="margin-top: 10px;">
-					🔄 Refresh
-				</button>
-			</div>
+      <div class="card">
+        <h3>Uploaded Screenshot</h3>
+        <!-- The extension passed this path as uploadedScreenshotUrl. Build step can transform it to a resource URL. -->
+        <div id="screenshotWrap"><img id="uploadedScreenshot" src="${uploadedScreenshotUrl}" alt="uploaded screenshot" /></div>
+        <div class="small">Path: <span id="uploadedPath">${uploadedScreenshotUrl}</span></div>
+      </div>
+    </div>
+  </div>
 
-			<div class="card">
-				<h2>🎬 Recording Controls</h2>
-				<div class="recording-indicator" id="recordingIndicator">
-					<span class="recording-dot"></span>
-					<span>Recording in progress</span>
-				</div>
-				<div style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
-					<button class="btn" id="startBtn" disabled>
-						⏺ Start Recording
-					</button>
-					<button class="btn btn-danger" id="stopBtn" disabled>
-						⏹ Stop Recording
-					</button>
-				</div>
-				<div class="status-message" id="statusMessage"></div>
-			</div>
-		</div>
-	</div>
+  <!-- socket.io (signaling) -->
+  <script src="https://voice-collab-room.onrender.com/socket.io/socket.io.js"></script>
 
-	<!-- Socket.IO from your Render server -->
-	<script src="https://voice-collab-room.onrender.com/socket.io/socket.io.js"></script>
+  <script>
+  (function () {
+    // ---- Config ----
+    const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
+    const nameInput = document.getElementById('nameInput');
+    const roomInput = document.getElementById('roomInput');
+    const createRoomBtn = document.getElementById('createRoomBtn');
+    const joinRoomBtn = document.getElementById('joinRoomBtn');
+    const turnOnCamBtn = document.getElementById('turnOnCamBtn');
+    const turnOffCamBtn = document.getElementById('turnOffCamBtn');
+    const startRecBtn = document.getElementById('startRecBtn');
+    const stopRecBtn = document.getElementById('stopRecBtn');
+    const previewCanvas = document.getElementById('previewCanvas');
+    const previewPlaceholder = document.getElementById('previewPlaceholder');
+    const ffmpegLog = document.getElementById('ffmpegLog');
+    const videoGrid = document.getElementById('videoGrid');
+    const ffmpegStatus = document.getElementById('ffmpegStatus');
 
-	<script>
-		const vscode = acquireVsCodeApi();
+    const ctx = previewCanvas.getContext('2d');
+    const devicePixel = window.devicePixelRatio || 1;
 
-		/* ==== FFmpeg recording UI (unchanged behaviour) ==== */
+    // WebRTC and local audio wiring
+    const socket = io(SIGNALING_SERVER);
+    const pcConfig = { iceServers: [ { urls: 'stun:stun.l.google.com:19302' } ] };
 
-		const bars = document.querySelectorAll('.audio-bar');
-		const previewVideo = document.getElementById('previewVideo');
-		const previewPlaceholder = document.getElementById('previewPlaceholder');
+    let localCanvasStream = null;      // canvas.captureStream()
+    let localAudioStreamTrack = null;  // produced by WebAudio -> MediaStream (destination)
+    let combinedLocalStream = null;    // stream we add to RTCPeerConnection (canvas + audio)
+    let audioWs = null;                // local WebSocket to extension (sends raw PCM)
+    let audioWsPort = null;
+    let gotFrame = false;
 
-		// Check requirements on load
-		vscode.postMessage({ command: 'checkRequirements' });
+    // audioWorklet helper: will create worklet that receives Float32 chunks via port.postMessage
+    async function createAudioPipelineSampleRate(sampleRate = 48000) {
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
 
-		document.getElementById('refreshBtn').addEventListener('click', () => {
-			vscode.postMessage({ command: 'checkRequirements' });
-		});
+      // create a blob for the worklet processor code
+      const workletCode = `
+      class PCMPlayerProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this._buffer = [];
+          this._readIndex = 0;
+          this._channelCount = 1;
+          this.port.onmessage = (ev) => {
+            // Expect Float32Array transferable
+            const data = ev.data;
+            if (data && data.buffer) {
+              this._buffer.push(data);
+            }
+          };
+        }
+        process(inputs, outputs, parameters) {
+          const output = outputs[0];
+          if (this._buffer.length === 0) {
+            // output silence
+            for (let ch = 0; ch < output.length; ch++) {
+              const out = output[ch];
+              out.fill(0);
+            }
+            return true;
+          }
+          // fill output with samples from queued buffers
+          const framesNeeded = output[0].length;
+          for (let ch = 0; ch < output.length; ch++) {
+            const out = output[ch];
+            let written = 0;
+            while (written < framesNeeded && this._buffer.length > 0) {
+              const front = this._buffer[0];
+              const available = front.length - this._readIndex;
+              const toCopy = Math.min(available, framesNeeded - written);
+              for (let i = 0; i < toCopy; i++) out[written + i] = front[this._readIndex + i];
+              this._readIndex += toCopy;
+              written += toCopy;
+              if (this._readIndex >= front.length) {
+                this._buffer.shift();
+                this._readIndex = 0;
+              }
+            }
+            // if not fully written, fill rest with zeros
+            for (let i = written; i < framesNeeded; i++) out[i] = 0;
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-player-processor', PCMPlayerProcessor);
+      `;
+      const blob = new Blob([workletCode], { type: 'application/javascript' });
+      const moduleUrl = URL.createObjectURL(blob);
+      try {
+        await audioContext.audioWorklet.addModule(moduleUrl);
+      } catch (e) {
+        console.warn('AudioWorklet addModule failed', e);
+        // fallback will be handled below
+      }
 
-		document.getElementById('startBtn').addEventListener('click', () => {
-			vscode.postMessage({ command: 'startRecording' });
-		});
+      const node = new AudioWorkletNode(audioContext, 'pcm-player-processor');
+      node.port.start();
 
-		document.getElementById('stopBtn').addEventListener('click', () => {
-			vscode.postMessage({ command: 'stopRecording' });
-		});
+      // connect to destination (MediaStream)
+      const destination = audioContext.createMediaStreamDestination();
+      node.connect(destination);
 
-		function updateAudioBars(level) {
-			bars.forEach((bar) => {
-				const height = Math.max(2, Math.random() * level);
-				bar.style.height = height + '%';
-			});
-		}
+      // return helpers to push Float32 arrays into the worklet
+      return {
+        audioContext,
+        destination,
+        node,
+        pushFloat32Array: (f32) => {
+          try {
+            node.port.postMessage(f32, [f32.buffer]);
+          } catch (e) {
+            // if transferable fails, send a copy
+            node.port.postMessage(f32);
+          }
+        }
+      };
+    }
 
-		function showStatus(message, type) {
-			const statusEl = document.getElementById('statusMessage');
-			statusEl.textContent = message;
-			statusEl.className = 'status-message active ' + type;
-		}
+    // fallback pipeline if audioWorklet not supported properly
+    async function createFallbackAudioPipeline(sampleRate = 48000) {
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+      const destination = audioContext.createMediaStreamDestination();
+      // We'll use a ScriptProcessorNode (deprecated) as fallback
+      const bufferSize = 4096;
+      const channels = 1;
+      const sp = audioContext.createScriptProcessor(bufferSize, 0, channels);
+      // ring buffer
+      const queue = [];
+      let queueReadIndex = 0;
 
-		window.addEventListener('message', event => {
-			const message = event.data;
-			
-			switch (message.command) {
-				case 'requirementsStatus': {
-					const ffmpegDot = document.getElementById('ffmpegDot');
-					const ffmpegStatus = document.getElementById('ffmpegStatus');
-					const startBtn = document.getElementById('startBtn');
-					
-					if (message.ffmpeg) {
-						ffmpegDot.className = 'status-dot status-ok';
-						ffmpegStatus.textContent = 'Installed ✓';
-						ffmpegStatus.style.color = '#4CAF50';
-						startBtn.disabled = false;
-					} else {
-						ffmpegDot.className = 'status-dot status-error';
-						ffmpegStatus.textContent = 'Missing ✗';
-						ffmpegStatus.style.color = '#f44336';
-					}
-					break;
-				}
-				
-				case 'frameUpdate':
-					previewPlaceholder.style.display = 'none';
-					previewVideo.style.display = 'block';
-					previewVideo.src = message.frame;
-					break;
-				
-				case 'recordingStarted':
-					document.getElementById('recordingIndicator').classList.add('active');
-					document.getElementById('startBtn').disabled = true;
-					document.getElementById('stopBtn').disabled = false;
-					showStatus('Recording: ' + message.path, 'success');
-					break;
-				
-				case 'recordingStopped':
-					document.getElementById('recordingIndicator').classList.remove('active');
-					document.getElementById('startBtn').disabled = false;
-					document.getElementById('stopBtn').disabled = true;
-					showStatus('Recording stopped successfully', 'success');
-					break;
-				
-				case 'audioLevel':
-					updateAudioBars(message.level);
-					break;
-			}
-		});
+      sp.onaudioprocess = (e) => {
+        const out = e.outputBuffer.getChannelData(0);
+        let written = 0;
+        while (written < out.length && queue.length > 0) {
+          const front = queue[0];
+          const avail = front.length - queueReadIndex;
+          const toCopy = Math.min(avail, out.length - written);
+          out.set(front.subarray(queueReadIndex, queueReadIndex + toCopy), written);
+          queueReadIndex += toCopy;
+          written += toCopy;
+          if (queueReadIndex >= front.length) {
+            queue.shift();
+            queueReadIndex = 0;
+          }
+        }
+        if (written < out.length) {
+          for (let i = written; i < out.length; i++) out[i] = 0;
+        }
+      };
 
-		/* ==== WebRTC Meet logic ==== */
-		const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
-		const socket = io(SIGNALING_SERVER);
+      // pushFloat32Array
+      function pushFloat32Array(f32) {
+        queue.push(f32);
+      }
 
-		const nameInput = document.getElementById('nameInput');
-		const roomInput = document.getElementById('roomInput');
-		const createRoomBtn = document.getElementById('createRoomBtn');
-		const joinRoomBtn = document.getElementById('joinRoomBtn');
-		const meetStatus = document.getElementById('meetStatus');
-		const videoGrid = document.getElementById('videoGrid');
+      sp.connect(destination);
+      return { audioContext, destination, sp, pushFloat32Array };
+    }
 
-		const pcConfig = {
-			iceServers: [
-				{ urls: 'stun:stun.l.google.com:19302' }
-			]
-		};
+    // Choose pipeline factory depending on availability
+    let audioPipeline = null;
+    async function ensureAudioPipeline() {
+      if (audioPipeline) return audioPipeline;
+      try {
+        audioPipeline = await createAudioPipelineSampleRate(48000);
+        console.log('Using AudioWorklet pipeline');
+      } catch (e) {
+        console.warn('AudioWorklet pipeline failed, using fallback', e);
+        audioPipeline = await createFallbackAudioPipeline(48000);
+      }
+      return audioPipeline;
+    }
 
-		let localStream = null;
-		const peerConnections = {}; // socketId -> RTCPeerConnection
-		const tiles = {}; // socketId or 'local' -> tile element
-		let handlersWired = false;
+    // connect to local audio WS (port received from extension)
+    function connectLocalAudioWs(port) {
+      if (!port) { console.warn('No port provided for local audio WS'); return; }
+      if (audioWs && audioWs.readyState === WebSocket.OPEN) return;
+      const url = 'ws://127.0.0.1:' + port;
+      console.log('Connecting to local audio WS at', url);
+      audioWs = new WebSocket(url);
+      audioWs.binaryType = 'arraybuffer';
+      audioWs.onopen = () => {
+        console.log('local audio WS open');
+      };
+      audioWs.onmessage = async (ev) => {
+        // ev.data is ArrayBuffer raw PCM s16le 48k mono
+        const ab = ev.data;
+        // Convert s16le to Float32 array in range [-1,1]
+        const s16 = new Int16Array(ab);
+        const f32 = new Float32Array(s16.length);
+        for (let i = 0; i < s16.length; i++) f32[i] = s16[i] / 32768;
+        const pipeline = await ensureAudioPipeline();
+        pipeline.pushFloat32Array(f32);
+      };
+      audioWs.onclose = () => {
+        console.log('local audio WS closed');
+        audioWs = null;
+      };
+      audioWs.onerror = (e) => {
+        console.warn('local audio WS error', e);
+      };
+    }
 
-		function setMeetStatus(text) {
-			meetStatus.textContent = text;
-		}
+    // draw JPEG frames onto canvas
+    function handleFrameDataURL(dataUrl) {
+      const img = new Image();
+      img.onload = () => {
+        const targetW = previewCanvas.clientWidth;
+        previewCanvas.width = targetW * devicePixel;
+        previewCanvas.height = (previewCanvas.width * img.height / img.width) | 0;
+        ctx.drawImage(img, 0, 0, previewCanvas.width, previewCanvas.height);
+        if (!gotFrame) {
+          gotFrame = true;
+          previewPlaceholder.style.display = 'none';
+          startLocalCaptureIfReady();
+        }
+      };
+      img.src = dataUrl;
+    }
 
-		function createTile(id, stream, label, isLocal) {
-			let tile = tiles[id];
-			let videoEl;
-			if (tile) {
-				videoEl = tile.querySelector('video');
-			} else {
-				tile = document.createElement('div');
-				tile.className = 'video-tile';
-				videoEl = document.createElement('video');
-				videoEl.autoplay = true;
-				videoEl.playsInline = true;
-				videoEl.muted = !!isLocal;
-				tile.appendChild(videoEl);
-				const lab = document.createElement('div');
-				lab.className = 'video-label';
-				lab.textContent = label || 'Guest';
-				tile.appendChild(lab);
-				videoGrid.appendChild(tile);
-				tiles[id] = tile;
-			}
-			videoEl.srcObject = stream;
-		}
+    // capture canvas and create combined stream with audio
+    async function startLocalCaptureIfReady() {
+      if (localCanvasStream) return;
+      // capture canvas
+      localCanvasStream = previewCanvas.captureStream(30);
+      // ensure audio pipeline exists and connect its destination to a track
+      const pipeline = await ensureAudioPipeline();
+      // destination is a MediaStream
+      const audioDestStream = pipeline.destination.stream || pipeline.destination;
+      // in case destination is a MediaStreamDestination node -> .stream
+      const audioTrack = audioDestStream.getAudioTracks()[0];
+      if (audioTrack) {
+        localAudioStreamTrack = audioTrack;
+        // add audio track to canvas stream
+        try {
+          localCanvasStream.addTrack(localAudioStreamTrack);
+        } catch (e) {
+          console.warn('Failed to add audio track to canvas stream', e);
+        }
+      } else {
+        console.warn('No audio track available from pipeline.destination');
+      }
+      combinedLocalStream = localCanvasStream;
+      // show local tile
+      addOrUpdateTile('local', combinedLocalStream, nameInput.value || 'Me (VS Code)', true);
+    }
 
-		function removeTile(id) {
-			const tile = tiles[id];
-			if (!tile) return;
-			tile.remove();
-			delete tiles[id];
-		}
+    // UI tile helpers
+    const tiles = {};
+    function addOrUpdateTile(id, stream, label, isLocal) {
+      let tile = tiles[id];
+      if (!tile) {
+        tile = document.createElement('div');
+        tile.className = 'video-tile';
+        const v = document.createElement('video');
+        v.autoplay = true; v.playsInline = true; v.muted = !!isLocal;
+        tile.appendChild(v);
+        const lab = document.createElement('div'); lab.className='video-label'; lab.textContent=label||id;
+        tile.appendChild(lab);
+        videoGrid.appendChild(tile);
+        tiles[id] = tile;
+      }
+      const videoEl = tile.querySelector('video');
+      videoEl.srcObject = stream;
+    }
+    function removeTile(id) {
+      const tile = tiles[id];
+      if (tile) { tile.remove(); delete tiles[id]; }
+    }
 
-		async function ensureLocalStream() {
-			if (localStream) return localStream;
-			try {
-				localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-				createTile('local', localStream, nameInput.value || 'Me (VS Code)', true);
-				return localStream;
-			} catch (e) {
-				setMeetStatus('Could not get camera/mic: ' + e.message);
-				throw e;
-			}
-		}
+    // --- WebRTC mesh logic using socket.io (SIGNALING_SERVER) ---
+    const pcs = {}; // peerId -> RTCPeerConnection
+    let wired = false;
 
-		function wireSocketHandlers() {
-			if (handlersWired) return;
-			handlersWired = true;
+    function wireSignalingHandlers() {
+      if (wired) return;
+      wired = true;
 
-			socket.on('new-peer', async ({ socketId, name }) => {
-				setMeetStatus('New peer joined: ' + (name || socketId));
-				createTile(socketId, new MediaStream(), name || 'Guest');
-				await createOfferTo(socketId);
-			});
+      socket.on('connect', () => {
+        console.log('connected to signaling server', socket.id);
+      });
 
-			socket.on('signal', async ({ from, data }) => {
-				if (!peerConnections[from]) {
-					await createPeerConnection(from, false);
-				}
-				const pc = peerConnections[from];
-				if (data.type === 'offer') {
-					await pc.setRemoteDescription(new RTCSessionDescription(data));
-					const answer = await pc.createAnswer();
-					await pc.setLocalDescription(answer);
-					socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
-				} else if (data.type === 'answer') {
-					await pc.setRemoteDescription(new RTCSessionDescription(data));
-				} else if (data.candidate) {
-					try {
-						await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
-					} catch (e) {
-						console.warn('Error adding candidate', e);
-					}
-				}
-			});
+      socket.on('new-peer', async ({ socketId, name }) => {
+        console.log('new-peer', socketId);
+        addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
+        await createOfferTo(socketId);
+      });
 
-			socket.on('peer-left', ({ socketId }) => {
-				setMeetStatus('Peer left: ' + socketId);
-				if (peerConnections[socketId]) {
-					peerConnections[socketId].close();
-					delete peerConnections[socketId];
-				}
-				removeTile(socketId);
-			});
-		}
+      socket.on('signal', async ({ from, data }) => {
+        if (!pcs[from]) await createPeerConnection(from, false);
+        const pc = pcs[from];
+        if (!pc) return;
+        if (data.type === 'offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(data));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
+        } else if (data.type === 'answer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(data));
+        } else if (data.candidate) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn(e); }
+        }
+      });
 
-		async function createPeerConnection(remoteId, isInitiator) {
-			if (peerConnections[remoteId]) return peerConnections[remoteId];
-			const pc = new RTCPeerConnection(pcConfig);
-			peerConnections[remoteId] = pc;
+      socket.on('peer-left', ({ socketId }) => {
+        console.log('peer-left', socketId);
+        if (pcs[socketId]) { try { pcs[socketId].close(); } catch {} delete pcs[socketId]; }
+        removeTile(socketId);
+      });
+    }
 
-			const stream = await ensureLocalStream();
-			for (const track of stream.getTracks()) {
-				pc.addTrack(track, stream);
-			}
+    async function createPeerConnection(remoteId, isInitiator) {
+      if (pcs[remoteId]) return pcs[remoteId];
+      const pc = new RTCPeerConnection(pcConfig);
+      pcs[remoteId] = pc;
 
-			const remoteStream = new MediaStream();
-			createTile(remoteId, remoteStream, remoteId, false);
+      // add local tracks (canvas + audio) if available
+      if (combinedLocalStream) {
+        for (const t of combinedLocalStream.getTracks()) pc.addTrack(t, combinedLocalStream);
+      }
 
-			pc.ontrack = (ev) => {
-				ev.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
-				createTile(remoteId, remoteStream, remoteId, false);
-			};
+      // remote stream collector
+      const remoteStream = new MediaStream();
+      addOrUpdateTile(remoteId, remoteStream, remoteId, false);
 
-			pc.onicecandidate = (ev) => {
-				if (ev.candidate) {
-					socket.emit('signal', {
-						to: remoteId,
-						from: socket.id,
-						data: { candidate: ev.candidate }
-					});
-				}
-			};
+      pc.ontrack = (ev) => {
+        ev.streams[0].getTracks().forEach(tr => remoteStream.addTrack(tr));
+        addOrUpdateTile(remoteId, remoteStream, remoteId, false);
+      };
 
-			pc.onconnectionstatechange = () => {
-				if (['failed','disconnected','closed'].includes(pc.connectionState)) {
-					try { pc.close(); } catch {}
-					delete peerConnections[remoteId];
-					removeTile(remoteId);
-				}
-			};
+      pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+          socket.emit('signal', { to: remoteId, from: socket.id, data: { candidate: ev.candidate }});
+        }
+      };
 
-			return pc;
-		}
+      pc.onconnectionstatechange = () => {
+        if (['failed','disconnected','closed'].includes(pc.connectionState)) {
+          try { pc.close(); } catch {}
+          delete pcs[remoteId];
+          removeTile(remoteId);
+        }
+      };
 
-		async function createOfferTo(remoteId) {
-			const pc = await createPeerConnection(remoteId, true);
-			const offer = await pc.createOffer();
-			await pc.setLocalDescription(offer);
-			socket.emit('signal', { to: remoteId, from: socket.id, data: pc.localDescription });
-		}
+      return pc;
+    }
 
-		createRoomBtn.addEventListener('click', async () => {
-			const roomId = (Math.random().toString(36).slice(2, 8)).toUpperCase();
-			roomInput.value = roomId;
-			await ensureLocalStream();
-			wireSocketHandlers();
-			socket.emit('create-room', { roomId, name: nameInput.value }, (res) => {
-				if (!res || !res.ok) {
-					setMeetStatus('Could not create room: ' + (res && res.message ? res.message : 'unknown error'));
-					return;
-				}
-				setMeetStatus('Created room ' + roomId + '. Share this code with others.');
-			});
-		});
+    async function createOfferTo(remoteId) {
+      const pc = await createPeerConnection(remoteId, true);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('signal', { to: remoteId, from: socket.id, data: pc.localDescription });
+    }
 
-		joinRoomBtn.addEventListener('click', async () => {
-			const roomId = (roomInput.value || '').trim().toUpperCase();
-			if (!roomId) {
-				setMeetStatus('Enter a room code to join.');
-				return;
-			}
-			await ensureLocalStream();
-			wireSocketHandlers();
-			socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
-				if (!res || !res.ok) {
-					setMeetStatus('Could not join room: ' + (res && res.message ? res.message : 'unknown error'));
-					return;
-				}
-				setMeetStatus('Joined room ' + roomId);
-				const others = res.others || [];
-				for (const otherId of others) {
-					await createOfferTo(otherId);
-				}
-			});
-		});
-	</script>
+    // UI actions: create/join rooms via signaling server
+    createRoomBtn.addEventListener('click', async () => {
+      const roomId = (Math.random().toString(36).slice(2,8)).toUpperCase();
+      roomInput.value = roomId;
+      wireSignalingHandlers();
+      socket.emit('create-room', { roomId, name: nameInput.value }, (res) => {
+        if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not create room');
+        alert('Room created: ' + roomId);
+      });
+    });
+
+    joinRoomBtn.addEventListener('click', async () => {
+      const roomId = (roomInput.value || '').trim().toUpperCase();
+      if (!roomId) return alert('Enter room code to join');
+      wireSignalingHandlers();
+
+      // ensure we have capture started (video+audio)
+      if (!gotFrame) {
+        return alert('Start the FFmpeg preview first (Turn Camera On) so the canvas stream is available, then join the room.');
+      }
+      // ensure audio pipeline is ready
+      await ensureAudioPipeline();
+
+      socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
+        if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not join room');
+        const others = res.others || [];
+        // create offers to existing members
+        for (const otherId of others) await createOfferTo(otherId);
+      });
+    });
+
+    // Turn camera on/off controls send messages to extension host to start/stop ffmpeg
+    turnOnCamBtn.addEventListener('click', () => {
+      // ask extension host to spin up ffmpeg preview + audio WS
+      vscode.postMessage({ command: 'turnCameraOn' });
+    });
+    turnOffCamBtn.addEventListener('click', () => {
+      vscode.postMessage({ command: 'turnCameraOff' });
+      // close local audio ws if open
+      try { if (audioWs) audioWs.close(); } catch (e) {}
+    });
+
+    startRecBtn.addEventListener('click', () => {
+      vscode.postMessage({ command: 'startRecording' });
+      stopRecBtn.disabled = false;
+      startRecBtn.disabled = true;
+    });
+    stopRecBtn.addEventListener('click', () => {
+      vscode.postMessage({ command: 'stopRecording' });
+      stopRecBtn.disabled = true;
+      startRecBtn.disabled = false;
+    });
+
+    // Handle messages from extension (frameUpdate, audioWsPort, etc.)
+    window.addEventListener('message', (ev) => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.command === 'frameUpdate' && msg.frame) {
+        handleFrameDataURL(msg.frame);
+      } else if (msg.command === 'ffmpegLog' && msg.text) {
+        ffmpegLog.textContent += msg.text + "\\n";
+        ffmpegLog.scrollTop = ffmpegLog.scrollHeight;
+      } else if (msg.command === 'requirementsStatus') {
+        ffmpegStatus.textContent = msg.ffmpeg ? 'Installed ✓' : 'Missing ✗';
+      } else if (msg.command === 'audioWsPort') {
+        audioWsPort = msg.port;
+        // connect immediately
+        connectLocalAudioWs(audioWsPort);
+      } else if (msg.command === 'previewStarted') {
+        previewPlaceholder.style.display = 'none';
+      } else if (msg.command === 'previewStopped') {
+        previewPlaceholder.style.display = 'block';
+      } else if (msg.command === 'recordingStarted') {
+        stopRecBtn.disabled = false;
+        startRecBtn.disabled = true;
+      } else if (msg.command === 'recordingStopped') {
+        stopRecBtn.disabled = true;
+        startRecBtn.disabled = false;
+      }
+    });
+
+    // initial check: ask extension for ffmpeg status
+    try { vscode.postMessage({ command: 'checkRequirements' }); } catch (e) { console.warn('vscode postMessage not available (outside extension)', e); }
+
+    // Expose debug helpers
+    window.__internal = {
+      connectLocalAudioWs,
+      ensureAudioPipeline,
+      createOfferTo,
+      createPeerConnection,
+      pcs,
+      combinedLocalStream,
+    };
+  })();
+  </script>
 </body>
-</html>`;
+</html>
+`;
 }
 
 function deactivate() {
   if (ffmpegProcess) {
-    ffmpegProcess.kill("SIGINT");
+    try { ffmpegProcess.kill("SIGINT"); } catch (e) {}
     ffmpegProcess = null;
   }
   if (previewProcess) {
-    previewProcess.kill();
+    try { previewProcess.kill("SIGINT"); } catch (e) {}
     previewProcess = null;
   }
+  stopLocalAudioWsServer();
 }
 
-module.exports = {
-  activate,
-  deactivate,
-};
+module.exports = { activate, deactivate };
