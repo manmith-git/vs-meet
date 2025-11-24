@@ -1,4 +1,4 @@
-// extension.js - final version
+// extension.js - CLEAN FIXED VERSION (screenshot removed)
 const vscode = require("vscode");
 const { exec, spawn } = require("child_process");
 const path = require("path");
@@ -10,17 +10,17 @@ let ffmpegProcess = null;
 let previewProcess = null;
 let isRecording = false;
 let currentRecordingPath = null;
-let audioWsServer = null; // WebSocket server instance
-let audioHttpServer = null; // underlying http server
+let audioWsServer = null;
+let audioHttpServer = null;
 let audioWsPort = null;
 
 const platform = os.platform();
 let platformModule;
 
+// Use your platform-specific module; fallback to windows one if others not provided
 if (platform === "win32") {
   platformModule = require("./platforms/windows");
 } else {
-  // Fallback: try windows module if others not implemented
   platformModule = require("./platforms/windows");
 }
 
@@ -36,29 +36,28 @@ function checkFfmpegInstalled() {
 
 function startLocalAudioWsServer() {
   return new Promise((resolve, reject) => {
-    if (audioWsServer && audioHttpServer && audioWsPort) {
+    if (audioWsServer && audioHttpServer && audioWsPort)
       return resolve(audioWsPort);
-    }
-    // create a tiny HTTP server and attach ws to it
+
     audioHttpServer = http.createServer((req, res) => {
       res.writeHead(200);
       res.end("OK");
     });
+
     audioHttpServer.listen(0, "127.0.0.1", () => {
       const addr = audioHttpServer.address();
       audioWsPort = addr.port;
       audioWsServer = new WebSocket.Server({ server: audioHttpServer });
       audioWsServer.on("connection", (ws) => {
-        console.log("Audio WS client connected");
-        ws.on("close", () => {
-          console.log("Audio WS client disconnected");
-        });
+        console.log("[audio-ws] client connected");
+        ws.on("close", () => console.log("[audio-ws] client disconnected"));
       });
-      console.log("Audio WS server listening on port", audioWsPort);
+      console.log("[audio-ws] listening on port", audioWsPort);
       resolve(audioWsPort);
     });
+
     audioHttpServer.on("error", (err) => {
-      console.error("Audio HTTP server error:", err);
+      console.error("[audio-ws] http server error", err);
       reject(err);
     });
   });
@@ -66,36 +65,39 @@ function startLocalAudioWsServer() {
 
 function broadcastAudioChunk(chunk) {
   if (!audioWsServer) return;
-  audioWsServer.clients.forEach((c) => {
-    if (c.readyState === WebSocket.OPEN) {
-      // send raw PCM as binary
-      c.send(chunk);
+  for (const client of audioWsServer.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(chunk);
     }
-  });
+  }
 }
 
 function stopLocalAudioWsServer() {
   if (audioWsServer) {
     try {
       audioWsServer.close();
-    } catch (e) {}
+    } catch (e) {
+      console.warn(e);
+    }
     audioWsServer = null;
   }
   if (audioHttpServer) {
     try {
       audioHttpServer.close();
-    } catch (e) {}
+    } catch (e) {
+      console.warn(e);
+    }
     audioHttpServer = null;
     audioWsPort = null;
   }
 }
 
 function activate(context) {
-  console.log("Camera Recorder + Meet extension activated!");
+  console.log("Camera Recorder + Meet extension activated");
 
   const disposable = vscode.commands.registerCommand(
     "meetup.openRecorder",
-    async function () {
+    async () => {
       const panel = vscode.window.createWebviewPanel(
         "cameraRecorder",
         "VS Code Meet",
@@ -107,15 +109,12 @@ function activate(context) {
         }
       );
 
-      // developer instruction: uploaded screenshot path (provided earlier)
-      // include it as the "uploaded file url" in the webview context
-      const uploadedScreenshotUrl = "sandbox:/mnt/data/Screenshot 2025-11-24 084215.png";
-
       let isDisposed = false;
-      await checkFfmpegInstalled();
-      panel.webview.html = getWebviewContent(uploadedScreenshotUrl);
 
-      // handle messages from webview (UI actions)
+      // set webview content (no screenshot to avoid interpolation issues)
+      panel.webview.html = getWebviewContent();
+
+      // handle messages from webview (UI)
       panel.webview.onDidReceiveMessage(
         async (message) => {
           if (!message || !message.command) return;
@@ -123,61 +122,80 @@ function activate(context) {
             switch (message.command) {
               case "checkRequirements": {
                 const ffmpeg = await checkFfmpegInstalled();
-                panel.webview.postMessage({ command: "requirementsStatus", ffmpeg });
+                panel.webview.postMessage({
+                  command: "requirementsStatus",
+                  ffmpeg,
+                });
                 break;
               }
 
               case "turnCameraOn": {
-                // Start preview-only ffmpeg (no file output) if not already running
                 if (previewProcess) {
-                  panel.webview.postMessage({ command: "previewAlreadyRunning" });
+                  panel.webview.postMessage({
+                    command: "previewAlreadyRunning",
+                  });
                   break;
                 }
-                // Start WS server for audio so webview can connect
+
+                // spin up local audio WS so webview can connect and receive raw PCM
                 const port = await startLocalAudioWsServer();
                 panel.webview.postMessage({ command: "audioWsPort", port });
 
-                // start ffmpeg preview with audio pipe:3 (RAW PCM s16le 48k mono)
+                // list devices
                 const devices = await listDevices();
-                if (devices.videoDevices.length === 0) {
-                  vscode.window.showErrorMessage("No video devices found. Please connect a camera.");
+                if (!devices || devices.videoDevices.length === 0) {
+                  vscode.window.showErrorMessage(
+                    "No video devices found. Please connect a camera."
+                  );
                   break;
                 }
-                const videoDeviceName = devices.videoDevices[0];
-                const audioDeviceName = devices.audioDevices.length > 0 ? devices.audioDevices[0] : null;
-                const videoArgs = getVideoInputArgs(videoDeviceName);
-                const audioArgs = audioDeviceName ? getAudioInputArgs(audioDeviceName) : [];
+                const videoDevice = devices.videoDevices[0];
+                const audioDevice =
+                  devices.audioDevices && devices.audioDevices.length
+                    ? devices.audioDevices[0]
+                    : null;
 
-                // Build ffmpeg args:
-                // video -> stdout (pipe:1) as mjpeg
-                // audio -> fd 3 (pipe:3) as raw PCM s16le 48000 1 channel
-                // no MP4 recording in preview mode
+                const videoArgs = getVideoInputArgs(videoDevice);
+                const audioArgs = audioDevice
+                  ? getAudioInputArgs(audioDevice)
+                  : [];
+
+                // build ffmpeg args for preview: video -> pipe:1 (mjpeg); audio -> pipe:3 (s16le)
                 const args = [
                   ...videoArgs,
-                  ...(audioArgs.length > 0 ? audioArgs : []),
-                  // video mapping
-                  "-map", "0:v",
-                  "-f", "image2pipe",
-                  "-vcodec", "mjpeg",
-                  "-q:v", "3",
+                  ...(audioArgs.length ? audioArgs : []),
+                  "-map",
+                  "0:v",
+                  "-f",
+                  "image2pipe",
+                  "-vcodec",
+                  "mjpeg",
+                  "-q:v",
+                  "3",
                   "pipe:1",
                 ];
-                // audio mapping -> raw PCM pipe:3
-                if (audioArgs.length > 0) {
+
+                if (audioArgs.length) {
                   args.push(
-                    "-map", "0:a",
-                    "-f", "s16le",
-                    "-ar", "48000",
-                    "-ac", "1",
+                    "-map",
+                    "0:a",
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "1",
                     "pipe:3"
                   );
                 }
 
-                console.log("Starting preview ffmpeg with args:", args.join(" "));
-                // spawn with three pipes: stdout (pipe), stderr (pipe), and fd 3 (pipe)
-                previewProcess = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe", "pipe"] });
+                console.log("[ffmpeg] starting preview:", args.join(" "));
+                // spawn with fd3 pipe for audio
+                previewProcess = spawn("ffmpeg", args, {
+                  stdio: ["ignore", "pipe", "pipe", "pipe"],
+                });
 
-                // handle mjpeg frames from stdout
+                // parse mjpeg from stdout
                 let frameBuffer = Buffer.alloc(0);
                 const JPEG_START = Buffer.from([0xff, 0xd8]);
                 const JPEG_END = Buffer.from([0xff, 0xd9]);
@@ -193,31 +211,31 @@ function activate(context) {
                     const frame = frameBuffer.slice(startIdx, endIdx + 2);
                     frameBuffer = frameBuffer.slice(endIdx + 2);
                     const base64 = frame.toString("base64");
-                    panel.webview.postMessage({ command: "frameUpdate", frame: `data:image/jpeg;base64,${base64}` });
+                    panel.webview.postMessage({
+                      command: "frameUpdate",
+                      frame: `data:image/jpeg;base64,${base64}`,
+                    });
                   }
-                  if (frameBuffer.length > 1024 * 1024) frameBuffer = Buffer.alloc(0);
+                  if (frameBuffer.length > 1024 * 1024)
+                    frameBuffer = Buffer.alloc(0);
                 });
 
-                // handle raw pcm audio from fd 3 (if audio mapped)
                 if (previewProcess.stdio && previewProcess.stdio[3]) {
                   previewProcess.stdio[3].on("data", (chunk) => {
-                    // broadcast raw PCM binary to connected WS clients
                     broadcastAudioChunk(chunk);
                   });
                   previewProcess.stdio[3].on("end", () => {
-                    console.log("Preview FFmpeg audio pipe ended");
+                    console.log("[ffmpeg] audio pipe ended");
                   });
                 }
 
                 previewProcess.stderr.on("data", (d) => {
-                  // optional logging for ffmpeg messages
                   const s = d.toString();
-                  // occasionally ffmpeg prints informative lines - forward audio level if parsed
                   panel.webview.postMessage({ command: "ffmpegLog", text: s });
                 });
 
                 previewProcess.on("exit", (code) => {
-                  console.log("Preview ffmpeg exited with code", code);
+                  console.log("[ffmpeg] preview exited", code);
                   previewProcess = null;
                 });
 
@@ -226,7 +244,6 @@ function activate(context) {
               }
 
               case "turnCameraOff": {
-                // stop preview process (but not recording)
                 if (previewProcess) {
                   try {
                     previewProcess.stdin && previewProcess.stdin.write("q");
@@ -236,90 +253,118 @@ function activate(context) {
                   } catch (e) {}
                   previewProcess = null;
                 }
-                // stop local audio ws server
                 stopLocalAudioWsServer();
                 panel.webview.postMessage({ command: "previewStopped" });
                 break;
               }
 
               case "startRecording": {
-                // start recording + preview (if already preview running, we'll also record)
                 if (isRecording) return;
                 const devices = await listDevices();
-                if (devices.videoDevices.length === 0) {
-                  vscode.window.showErrorMessage("No video devices found. Please connect a camera.");
+                if (!devices || devices.videoDevices.length === 0) {
+                  vscode.window.showErrorMessage(
+                    "No video devices found. Please connect a camera."
+                  );
                   break;
                 }
                 const videoDeviceName = devices.videoDevices[0];
-                const audioDeviceName = devices.audioDevices.length > 0 ? devices.audioDevices[0] : null;
+                const audioDeviceName =
+                  devices.audioDevices && devices.audioDevices.length
+                    ? devices.audioDevices[0]
+                    : null;
 
                 const workspaceFolders = vscode.workspace.workspaceFolders;
-                const outputDir = workspaceFolders ? workspaceFolders[0].uri.fsPath : require("os").homedir();
-                const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-                const outputPath = path.join(outputDir, `recording-${timestamp}.mp4`);
+                const outputDir = workspaceFolders
+                  ? workspaceFolders[0].uri.fsPath
+                  : require("os").homedir();
+                const timestamp = new Date()
+                  .toISOString()
+                  .replace(/[:.]/g, "-");
+                const outputPath = path.join(
+                  outputDir,
+                  `recording-${timestamp}.mp4`
+                );
 
-                // Build ffmpeg args: same as before but with mp4 output (file) + image2pipe stdout for preview + pipe:3 audio
                 const videoArgs = getVideoInputArgs(videoDeviceName);
-                const audioArgs = audioDeviceName ? getAudioInputArgs(audioDeviceName) : [];
+                const audioArgs = audioDeviceName
+                  ? getAudioInputArgs(audioDeviceName)
+                  : [];
 
-                // ensure audio ws server is running
+                // ensure audio WS server running
                 const port = await startLocalAudioWsServer();
                 panel.webview.postMessage({ command: "audioWsPort", port });
 
                 const args = [
                   ...videoArgs,
-                  ...(audioArgs.length > 0 ? audioArgs : []),
-                  // stdout preview
-                  "-map", "0:v",
-                  "-f", "image2pipe",
-                  "-vcodec", "mjpeg",
-                  "-q:v", "3",
+                  ...(audioArgs.length ? audioArgs : []),
+                  "-map",
+                  "0:v",
+                  "-f",
+                  "image2pipe",
+                  "-vcodec",
+                  "mjpeg",
+                  "-q:v",
+                  "3",
                   "pipe:1",
                 ];
 
                 if (audioArgs.length > 0) {
-                  // also map audio to pipe:3 and include in mp4
                   args.push(
-                    "-map", "0:a",
-                    "-f", "s16le",
-                    "-ar", "48000",
-                    "-ac", "1",
+                    "-map",
+                    "1:a", // microphone is input #1
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    "48000", // resample → 48kHz
+                    "-ac",
+                    "1", // downmix stereo → mono
                     "pipe:3"
                   );
                 }
 
-                // mp4 output mapping: create mp4 from the devices (video + audio)
-                // We'll append another mapping to generate mp4 file using libx264 + aac if audio exists
-                if (audioArgs.length > 0) {
+                // add mp4 output mapping
+                if (audioArgs.length) {
                   args.push(
-                    "-map", "0:v",
-                    "-map", "0:a",
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-crf", "23",
-                    "-c:a", "aac",
-                    "-b:a", "128k",
+                    "-map",
+                    "0:v",
+                    "-map",
+                    "1:a",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
                     "-y",
                     outputPath
                   );
                 } else {
                   args.push(
-                    "-map", "0:v",
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-crf", "23",
+                    "-map",
+                    "0:v",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "23",
                     "-y",
                     outputPath
                   );
                 }
 
-                console.log("Starting recording ffmpeg with args:", args.join(" "));
+                console.log("[ffmpeg] starting recording:", args.join(" "));
                 isRecording = true;
                 currentRecordingPath = outputPath;
-                // spawn with pipe: stdout and pipe:3 for audio
-                previewProcess = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe", "pipe"] });
+                previewProcess = spawn("ffmpeg", args, {
+                  stdio: ["ignore", "pipe", "pipe", "pipe"],
+                });
 
-                // handle frames (same logic)
+                // frames for preview
                 let frameBuf = Buffer.alloc(0);
                 const JPEG_S = Buffer.from([0xff, 0xd8]);
                 const JPEG_E = Buffer.from([0xff, 0xd9]);
@@ -334,47 +379,60 @@ function activate(context) {
                     const frame = frameBuf.slice(sIdx, eIdx + 2);
                     frameBuf = frameBuf.slice(eIdx + 2);
                     const base64 = frame.toString("base64");
-                    panel.webview.postMessage({ command: "frameUpdate", frame: `data:image/jpeg;base64,${base64}` });
+                    panel.webview.postMessage({
+                      command: "frameUpdate",
+                      frame: `data:image/jpeg;base64,${base64}`,
+                    });
                   }
                   if (frameBuf.length > 1024 * 1024) frameBuf = Buffer.alloc(0);
                 });
 
-                // audio pipe
                 if (previewProcess.stdio && previewProcess.stdio[3]) {
-                  previewProcess.stdio[3].on("data", (chunk) => {
-                    broadcastAudioChunk(chunk);
-                  });
+                  previewProcess.stdio[3].on("data", (chunk) =>
+                    broadcastAudioChunk(chunk)
+                  );
                 }
 
                 previewProcess.stderr.on("data", (d) => {
-                  const s = d.toString();
-                  panel.webview.postMessage({ command: "ffmpegLog", text: s });
+                  panel.webview.postMessage({
+                    command: "ffmpegLog",
+                    text: d.toString(),
+                  });
                 });
 
                 previewProcess.on("exit", (code) => {
-                  console.log("Recording ffmpeg exited with code", code);
-                  if (isRecording) {
-                    if (code === 0 || code === 255) {
-                      vscode.window.showInformationMessage(`Recording saved: ${currentRecordingPath}`);
-                    } else {
-                      vscode.window.showErrorMessage(`Recording failed with code ${code}`);
-                    }
-                  }
+                  console.log("[ffmpeg] recording exited", code);
                   isRecording = false;
                   panel.webview.postMessage({ command: "recordingStopped" });
+                  if (code === 0 || code === 255) {
+                    vscode.window.showInformationMessage(
+                      `Recording saved: ${currentRecordingPath}`
+                    );
+                  } else {
+                    vscode.window.showErrorMessage(
+                      `Recording failed with code ${code}`
+                    );
+                  }
                 });
 
-                panel.webview.postMessage({ command: "recordingStarted", path: outputPath });
+                panel.webview.postMessage({
+                  command: "recordingStarted",
+                  path: outputPath,
+                });
                 break;
               }
 
               case "stopRecording": {
                 if (!isRecording || !previewProcess) return;
                 isRecording = false;
-                try { previewProcess.stdin && previewProcess.stdin.write("q"); } catch (e) {}
+                try {
+                  previewProcess.stdin && previewProcess.stdin.write("q");
+                } catch (e) {}
                 setTimeout(() => {
                   if (previewProcess) {
-                    try { previewProcess.kill("SIGTERM"); } catch (e) {}
+                    try {
+                      previewProcess.kill("SIGTERM");
+                    } catch (e) {}
                     previewProcess = null;
                   }
                 }, 1000);
@@ -383,10 +441,10 @@ function activate(context) {
               }
 
               default:
-                console.log("Unknown command from webview:", message.command);
+                console.log("[webview] unknown command", message.command);
             }
           } catch (err) {
-            console.error("Error handling webview message", err);
+            console.error("[webview message handler] error:", err);
           }
         },
         undefined,
@@ -396,16 +454,18 @@ function activate(context) {
       panel.onDidDispose(
         () => {
           isDisposed = true;
-          // stop ffmpeg processes
           if (previewProcess) {
-            try { previewProcess.kill("SIGTERM"); } catch (e) {}
+            try {
+              previewProcess.kill("SIGTERM");
+            } catch (e) {}
             previewProcess = null;
           }
           if (ffmpegProcess) {
-            try { ffmpegProcess.kill("SIGINT"); } catch (e) {}
+            try {
+              ffmpegProcess.kill("SIGINT");
+            } catch (e) {}
             ffmpegProcess = null;
           }
-          // stop ws server
           stopLocalAudioWsServer();
         },
         undefined,
@@ -417,12 +477,11 @@ function activate(context) {
   context.subscriptions.push(disposable);
 }
 
-function getWebviewContent(uploadedScreenshotUrl) {
-  // SIGNALING_SERVER used by the webview JS for socket.io connections (your Render server)
+// getWebviewContent (NO screenshot)
+function getWebviewContent() {
+  // signaling server URL (your render instance)
   const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
 
-  // We'll include the local audio WS port dynamically by sending a message 'audioWsPort' from extension to webview when server starts
-  // webview will call window.connectLocalAudioWS(port)
   return `<!doctype html>
 <html>
 <head>
@@ -444,10 +503,8 @@ function getWebviewContent(uploadedScreenshotUrl) {
   .video-tile{ background:#111; border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
   .video-tile video{ width:100%; height:140px; object-fit:cover; background:#000; }
   .video-label{ padding:6px 8px; font-size:12px; color:#fff; text-align:center; background:rgba(0,0,0,0.6); }
-  .controls-row{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .status{ font-size:13px; color:var(--vscode-descriptionForeground); margin-top:6px;}
   .small { font-size:12px; color: #bbb; word-break:break-all; }
-  img#uploadedScreenshot { width:100%; border-radius:6px; margin-top:6px; }
 </style>
 </head>
 <body>
@@ -485,21 +542,22 @@ function getWebviewContent(uploadedScreenshotUrl) {
       </div>
 
       <div class="card">
-        <h3>Uploaded Screenshot</h3>
-        <!-- The extension passed this path as uploadedScreenshotUrl. Build step can transform it to a resource URL. -->
-        <div id="screenshotWrap"><img id="uploadedScreenshot" src="${uploadedScreenshotUrl}" alt="uploaded screenshot" /></div>
-        <div class="small">Path: <span id="uploadedPath">${uploadedScreenshotUrl}</span></div>
+        <h3>Info</h3>
+        <div class="small">Screenshot card removed (Option A)</div>
       </div>
     </div>
   </div>
 
-  <!-- socket.io (signaling) -->
-  <script src="https://voice-collab-room.onrender.com/socket.io/socket.io.js"></script>
+  <!-- socket.io from your signaling server -->
+  <script src="${SIGNALING_SERVER}/socket.io/socket.io.js"></script>
 
   <script>
   (function () {
-    // ---- Config ----
-    const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
+    // Ensure vscode messaging is available inside webview
+    const vscode = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
+
+    // Config
+    const SIGNALING_SERVER = "${SIGNALING_SERVER}";
     const nameInput = document.getElementById('nameInput');
     const roomInput = document.getElementById('roomInput');
     const createRoomBtn = document.getElementById('createRoomBtn');
@@ -517,116 +575,84 @@ function getWebviewContent(uploadedScreenshotUrl) {
     const ctx = previewCanvas.getContext('2d');
     const devicePixel = window.devicePixelRatio || 1;
 
-    // WebRTC and local audio wiring
-    const socket = io(SIGNALING_SERVER);
-    const pcConfig = { iceServers: [ { urls: 'stun:stun.l.google.com:19302' } ] };
+    // safe socket creation
+    let socket = null;
+    try {
+      if (typeof io === 'function') {
+        socket = io(SIGNALING_SERVER);
+      } else {
+        console.warn('[webview] socket.io client (io) not found - signaling disabled');
+      }
+    } catch (e) {
+      console.warn('[webview] socket.io init failed', e);
+      socket = null;
+    }
 
-    let localCanvasStream = null;      // canvas.captureStream()
-    let localAudioStreamTrack = null;  // produced by WebAudio -> MediaStream (destination)
-    let combinedLocalStream = null;    // stream we add to RTCPeerConnection (canvas + audio)
-    let audioWs = null;                // local WebSocket to extension (sends raw PCM)
+    if (!socket) {
+      createRoomBtn.disabled = true;
+      joinRoomBtn.disabled = true;
+      const msg = document.createElement('div');
+      msg.style.color = '#f88';
+      msg.textContent = 'Signaling client failed to load. Check network or server.';
+      document.querySelector('.topbar').appendChild(msg);
+    }
+
+    const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+    // local capture vars
+    let localCanvasStream = null;
+    let localAudioStreamTrack = null;
+    let combinedLocalStream = null;
+    let audioWs = null;
     let audioWsPort = null;
     let gotFrame = false;
 
-    // audioWorklet helper: will create worklet that receives Float32 chunks via port.postMessage
+    // audio pipeline (AudioWorklet preferred)
     async function createAudioPipelineSampleRate(sampleRate = 48000) {
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
-
-      // create a blob for the worklet processor code
-      const workletCode = `
+      const workletCode = \`
       class PCMPlayerProcessor extends AudioWorkletProcessor {
-        constructor() {
-          super();
-          this._buffer = [];
-          this._readIndex = 0;
-          this._channelCount = 1;
-          this.port.onmessage = (ev) => {
-            // Expect Float32Array transferable
-            const data = ev.data;
-            if (data && data.buffer) {
-              this._buffer.push(data);
-            }
-          };
-        }
-        process(inputs, outputs, parameters) {
+        constructor() { super(); this._buffer = []; this._readIndex = 0; this.port.onmessage = (ev) => { const data = ev.data; if (data && data.buffer) this._buffer.push(data); }; }
+        process(inputs, outputs) {
           const output = outputs[0];
-          if (this._buffer.length === 0) {
-            // output silence
-            for (let ch = 0; ch < output.length; ch++) {
-              const out = output[ch];
-              out.fill(0);
-            }
-            return true;
-          }
-          // fill output with samples from queued buffers
+          if (this._buffer.length === 0) { for (let ch = 0; ch < output.length; ch++) output[ch].fill(0); return true; }
           const framesNeeded = output[0].length;
           for (let ch = 0; ch < output.length; ch++) {
             const out = output[ch];
             let written = 0;
             while (written < framesNeeded && this._buffer.length > 0) {
               const front = this._buffer[0];
-              const available = front.length - this._readIndex;
-              const toCopy = Math.min(available, framesNeeded - written);
+              const avail = front.length - this._readIndex;
+              const toCopy = Math.min(avail, framesNeeded - written);
               for (let i = 0; i < toCopy; i++) out[written + i] = front[this._readIndex + i];
               this._readIndex += toCopy;
               written += toCopy;
-              if (this._readIndex >= front.length) {
-                this._buffer.shift();
-                this._readIndex = 0;
-              }
+              if (this._readIndex >= front.length) { this._buffer.shift(); this._readIndex = 0; }
             }
-            // if not fully written, fill rest with zeros
             for (let i = written; i < framesNeeded; i++) out[i] = 0;
           }
           return true;
         }
       }
       registerProcessor('pcm-player-processor', PCMPlayerProcessor);
-      `;
+      \`;
       const blob = new Blob([workletCode], { type: 'application/javascript' });
-      const moduleUrl = URL.createObjectURL(blob);
-      try {
-        await audioContext.audioWorklet.addModule(moduleUrl);
-      } catch (e) {
-        console.warn('AudioWorklet addModule failed', e);
-        // fallback will be handled below
-      }
-
+      const url = URL.createObjectURL(blob);
+      try { await audioContext.audioWorklet.addModule(url); } catch (e) { console.warn('[audio] worklet add failed', e); }
       const node = new AudioWorkletNode(audioContext, 'pcm-player-processor');
       node.port.start();
-
-      // connect to destination (MediaStream)
       const destination = audioContext.createMediaStreamDestination();
       node.connect(destination);
-
-      // return helpers to push Float32 arrays into the worklet
-      return {
-        audioContext,
-        destination,
-        node,
-        pushFloat32Array: (f32) => {
-          try {
-            node.port.postMessage(f32, [f32.buffer]);
-          } catch (e) {
-            // if transferable fails, send a copy
-            node.port.postMessage(f32);
-          }
-        }
-      };
+      return { audioContext, destination, node, pushFloat32Array: (f32) => { try { node.port.postMessage(f32, [f32.buffer]); } catch (e) { node.port.postMessage(f32); } } };
     }
 
-    // fallback pipeline if audioWorklet not supported properly
     async function createFallbackAudioPipeline(sampleRate = 48000) {
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
       const destination = audioContext.createMediaStreamDestination();
-      // We'll use a ScriptProcessorNode (deprecated) as fallback
       const bufferSize = 4096;
-      const channels = 1;
-      const sp = audioContext.createScriptProcessor(bufferSize, 0, channels);
-      // ring buffer
+      const sp = audioContext.createScriptProcessor(bufferSize, 0, 1);
       const queue = [];
       let queueReadIndex = 0;
-
       sp.onaudioprocess = (e) => {
         const out = e.outputBuffer.getChannelData(0);
         let written = 0;
@@ -637,70 +663,42 @@ function getWebviewContent(uploadedScreenshotUrl) {
           out.set(front.subarray(queueReadIndex, queueReadIndex + toCopy), written);
           queueReadIndex += toCopy;
           written += toCopy;
-          if (queueReadIndex >= front.length) {
-            queue.shift();
-            queueReadIndex = 0;
-          }
+          if (queueReadIndex >= front.length) { queue.shift(); queueReadIndex = 0; }
         }
-        if (written < out.length) {
-          for (let i = written; i < out.length; i++) out[i] = 0;
-        }
+        if (written < out.length) for (let i = written; i < out.length; i++) out[i] = 0;
       };
-
-      // pushFloat32Array
-      function pushFloat32Array(f32) {
-        queue.push(f32);
-      }
-
       sp.connect(destination);
-      return { audioContext, destination, sp, pushFloat32Array };
+      return { audioContext, destination, sp, pushFloat32Array: (f32) => queue.push(f32) };
     }
 
-    // Choose pipeline factory depending on availability
     let audioPipeline = null;
     async function ensureAudioPipeline() {
       if (audioPipeline) return audioPipeline;
-      try {
-        audioPipeline = await createAudioPipelineSampleRate(48000);
-        console.log('Using AudioWorklet pipeline');
-      } catch (e) {
-        console.warn('AudioWorklet pipeline failed, using fallback', e);
-        audioPipeline = await createFallbackAudioPipeline(48000);
-      }
+      try { audioPipeline = await createAudioPipelineSampleRate(48000); console.log('[audio] using worklet'); }
+      catch (e) { console.warn('[audio] worklet failed, fallback', e); audioPipeline = await createFallbackAudioPipeline(48000); }
       return audioPipeline;
     }
 
-    // connect to local audio WS (port received from extension)
     function connectLocalAudioWs(port) {
-      if (!port) { console.warn('No port provided for local audio WS'); return; }
+      if (!port) return console.warn('[audio-ws] no port provided');
       if (audioWs && audioWs.readyState === WebSocket.OPEN) return;
       const url = 'ws://127.0.0.1:' + port;
-      console.log('Connecting to local audio WS at', url);
+      console.log('[audio-ws] connecting to', url);
       audioWs = new WebSocket(url);
       audioWs.binaryType = 'arraybuffer';
-      audioWs.onopen = () => {
-        console.log('local audio WS open');
-      };
+      audioWs.onopen = () => console.log('[audio-ws] open');
       audioWs.onmessage = async (ev) => {
-        // ev.data is ArrayBuffer raw PCM s16le 48k mono
         const ab = ev.data;
-        // Convert s16le to Float32 array in range [-1,1]
         const s16 = new Int16Array(ab);
         const f32 = new Float32Array(s16.length);
         for (let i = 0; i < s16.length; i++) f32[i] = s16[i] / 32768;
         const pipeline = await ensureAudioPipeline();
         pipeline.pushFloat32Array(f32);
       };
-      audioWs.onclose = () => {
-        console.log('local audio WS closed');
-        audioWs = null;
-      };
-      audioWs.onerror = (e) => {
-        console.warn('local audio WS error', e);
-      };
+      audioWs.onclose = () => { console.log('[audio-ws] closed'); audioWs = null; };
+      audioWs.onerror = (e) => console.warn('[audio-ws] error', e);
     }
 
-    // draw JPEG frames onto canvas
     function handleFrameDataURL(dataUrl) {
       const img = new Image();
       img.onload = () => {
@@ -717,108 +715,91 @@ function getWebviewContent(uploadedScreenshotUrl) {
       img.src = dataUrl;
     }
 
-    // capture canvas and create combined stream with audio
     async function startLocalCaptureIfReady() {
       if (localCanvasStream) return;
-      // capture canvas
       localCanvasStream = previewCanvas.captureStream(30);
-      // ensure audio pipeline exists and connect its destination to a track
       const pipeline = await ensureAudioPipeline();
-      // destination is a MediaStream
       const audioDestStream = pipeline.destination.stream || pipeline.destination;
-      // in case destination is a MediaStreamDestination node -> .stream
       const audioTrack = audioDestStream.getAudioTracks()[0];
       if (audioTrack) {
         localAudioStreamTrack = audioTrack;
-        // add audio track to canvas stream
-        try {
-          localCanvasStream.addTrack(localAudioStreamTrack);
-        } catch (e) {
-          console.warn('Failed to add audio track to canvas stream', e);
-        }
-      } else {
-        console.warn('No audio track available from pipeline.destination');
-      }
+        try { localCanvasStream.addTrack(localAudioStreamTrack); } catch (e) { console.warn('[capture] addTrack failed', e); }
+      } else console.warn('[capture] no audio track from pipeline');
       combinedLocalStream = localCanvasStream;
-      // show local tile
       addOrUpdateTile('local', combinedLocalStream, nameInput.value || 'Me (VS Code)', true);
     }
 
-    // UI tile helpers
     const tiles = {};
     function addOrUpdateTile(id, stream, label, isLocal) {
       let tile = tiles[id];
       if (!tile) {
-        tile = document.createElement('div');
-        tile.className = 'video-tile';
-        const v = document.createElement('video');
-        v.autoplay = true; v.playsInline = true; v.muted = !!isLocal;
+        tile = document.createElement('div'); tile.className = 'video-tile';
+        const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = !!isLocal;
         tile.appendChild(v);
-        const lab = document.createElement('div'); lab.className='video-label'; lab.textContent=label||id;
+        const lab = document.createElement('div'); lab.className = 'video-label'; lab.textContent = label || id;
         tile.appendChild(lab);
         videoGrid.appendChild(tile);
         tiles[id] = tile;
       }
       const videoEl = tile.querySelector('video');
-      videoEl.srcObject = stream;
+      if (videoEl.srcObject !== stream) videoEl.srcObject = stream;
+      videoEl.play().catch(()=>{});
     }
-    function removeTile(id) {
-      const tile = tiles[id];
-      if (tile) { tile.remove(); delete tiles[id]; }
-    }
+    function removeTile(id) { const t = tiles[id]; if (t) { t.remove(); delete tiles[id]; } }
 
-    // --- WebRTC mesh logic using socket.io (SIGNALING_SERVER) ---
-    const pcs = {}; // peerId -> RTCPeerConnection
+    // WebRTC mesh
+    const pcs = {};
     let wired = false;
 
     function wireSignalingHandlers() {
       if (wired) return;
+      if (!socket) { console.warn('[signal] socket missing'); return; }
       wired = true;
 
-      socket.on('connect', () => {
-        console.log('connected to signaling server', socket.id);
-      });
+      socket.on('connect', () => console.log('[signal] connected', socket.id));
 
-      socket.on('new-peer', async ({ socketId, name }) => {
-        console.log('new-peer', socketId);
+      // Important: do NOT create offer on new-peer (prevents glare). Joiner will create offers.
+      socket.on('new-peer', ({ socketId, name }) => {
+        console.log('[signal] new-peer', socketId, name);
         addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
-        await createOfferTo(socketId);
       });
 
       socket.on('signal', async ({ from, data }) => {
         if (!pcs[from]) await createPeerConnection(from, false);
         const pc = pcs[from];
         if (!pc) return;
-        if (data.type === 'offer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(data));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
-        } else if (data.type === 'answer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(data));
-        } else if (data.candidate) {
-          try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn(e); }
+        try {
+          if (data.type === 'offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(data));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
+          } else if (data.type === 'answer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(data));
+          } else if (data.candidate) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn(e); }
+          }
+        } catch (err) {
+          console.error('[signal] process error', err);
         }
       });
 
       socket.on('peer-left', ({ socketId }) => {
-        console.log('peer-left', socketId);
+        console.log('[signal] peer-left', socketId);
         if (pcs[socketId]) { try { pcs[socketId].close(); } catch {} delete pcs[socketId]; }
         removeTile(socketId);
       });
     }
 
-    async function createPeerConnection(remoteId, isInitiator) {
+    async function createPeerConnection(remoteId) {
       if (pcs[remoteId]) return pcs[remoteId];
       const pc = new RTCPeerConnection(pcConfig);
       pcs[remoteId] = pc;
 
-      // add local tracks (canvas + audio) if available
       if (combinedLocalStream) {
         for (const t of combinedLocalStream.getTracks()) pc.addTrack(t, combinedLocalStream);
       }
 
-      // remote stream collector
       const remoteStream = new MediaStream();
       addOrUpdateTile(remoteId, remoteStream, remoteId, false);
 
@@ -828,9 +809,7 @@ function getWebviewContent(uploadedScreenshotUrl) {
       };
 
       pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
-          socket.emit('signal', { to: remoteId, from: socket.id, data: { candidate: ev.candidate }});
-        }
+        if (ev.candidate) socket.emit('signal', { to: remoteId, from: socket.id, data: { candidate: ev.candidate } });
       };
 
       pc.onconnectionstatechange = () => {
@@ -845,14 +824,15 @@ function getWebviewContent(uploadedScreenshotUrl) {
     }
 
     async function createOfferTo(remoteId) {
-      const pc = await createPeerConnection(remoteId, true);
+      const pc = await createPeerConnection(remoteId);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit('signal', { to: remoteId, from: socket.id, data: pc.localDescription });
     }
 
-    // UI actions: create/join rooms via signaling server
+    // UI actions
     createRoomBtn.addEventListener('click', async () => {
+      if (!socket) return alert('Signaling unavailable');
       const roomId = (Math.random().toString(36).slice(2,8)).toUpperCase();
       roomInput.value = roomId;
       wireSignalingHandlers();
@@ -863,87 +843,61 @@ function getWebviewContent(uploadedScreenshotUrl) {
     });
 
     joinRoomBtn.addEventListener('click', async () => {
+      if (!socket) return alert('Signaling unavailable');
       const roomId = (roomInput.value || '').trim().toUpperCase();
-      if (!roomId) return alert('Enter room code to join');
+      if (!roomId) return alert('Enter room code');
       wireSignalingHandlers();
-
-      // ensure we have capture started (video+audio)
-      if (!gotFrame) {
-        return alert('Start the FFmpeg preview first (Turn Camera On) so the canvas stream is available, then join the room.');
-      }
-      // ensure audio pipeline is ready
+      if (!gotFrame) return alert('Start FFmpeg preview first (Turn Camera On) then join the room.');
       await ensureAudioPipeline();
-
       socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
         if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not join room');
         const others = res.others || [];
-        // create offers to existing members
-        for (const otherId of others) await createOfferTo(otherId);
+        for (const id of others) await createOfferTo(id); // JOINER creates offers
       });
     });
 
-    // Turn camera on/off controls send messages to extension host to start/stop ffmpeg
+    // extension messaging
     turnOnCamBtn.addEventListener('click', () => {
-      // ask extension host to spin up ffmpeg preview + audio WS
+      if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'turnCameraOn' });
     });
     turnOffCamBtn.addEventListener('click', () => {
+      if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'turnCameraOff' });
-      // close local audio ws if open
       try { if (audioWs) audioWs.close(); } catch (e) {}
     });
 
     startRecBtn.addEventListener('click', () => {
+      if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'startRecording' });
       stopRecBtn.disabled = false;
       startRecBtn.disabled = true;
     });
     stopRecBtn.addEventListener('click', () => {
+      if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'stopRecording' });
       stopRecBtn.disabled = true;
       startRecBtn.disabled = false;
     });
 
-    // Handle messages from extension (frameUpdate, audioWsPort, etc.)
+    // messages from extension host
     window.addEventListener('message', (ev) => {
       const msg = ev.data;
       if (!msg) return;
-      if (msg.command === 'frameUpdate' && msg.frame) {
-        handleFrameDataURL(msg.frame);
-      } else if (msg.command === 'ffmpegLog' && msg.text) {
-        ffmpegLog.textContent += msg.text + "\\n";
-        ffmpegLog.scrollTop = ffmpegLog.scrollHeight;
-      } else if (msg.command === 'requirementsStatus') {
-        ffmpegStatus.textContent = msg.ffmpeg ? 'Installed ✓' : 'Missing ✗';
-      } else if (msg.command === 'audioWsPort') {
-        audioWsPort = msg.port;
-        // connect immediately
-        connectLocalAudioWs(audioWsPort);
-      } else if (msg.command === 'previewStarted') {
-        previewPlaceholder.style.display = 'none';
-      } else if (msg.command === 'previewStopped') {
-        previewPlaceholder.style.display = 'block';
-      } else if (msg.command === 'recordingStarted') {
-        stopRecBtn.disabled = false;
-        startRecBtn.disabled = true;
-      } else if (msg.command === 'recordingStopped') {
-        stopRecBtn.disabled = true;
-        startRecBtn.disabled = false;
-      }
+      if (msg.command === 'frameUpdate' && msg.frame) handleFrameDataURL(msg.frame);
+      else if (msg.command === 'ffmpegLog' && msg.text) { ffmpegLog.textContent += msg.text + "\\n"; ffmpegLog.scrollTop = ffmpegLog.scrollHeight; }
+      else if (msg.command === 'requirementsStatus') ffmpegStatus.textContent = msg.ffmpeg ? 'Installed ✓' : 'Missing ✗';
+      else if (msg.command === 'audioWsPort') { audioWsPort = msg.port; connectLocalAudioWs(audioWsPort); }
+      else if (msg.command === 'previewStarted') previewPlaceholder.style.display = 'none';
+      else if (msg.command === 'previewStopped') previewPlaceholder.style.display = 'block';
+      else if (msg.command === 'recordingStarted') { stopRecBtn.disabled = false; startRecBtn.disabled = true; }
+      else if (msg.command === 'recordingStopped') { stopRecBtn.disabled = true; startRecBtn.disabled = false; }
     });
 
-    // initial check: ask extension for ffmpeg status
-    try { vscode.postMessage({ command: 'checkRequirements' }); } catch (e) { console.warn('vscode postMessage not available (outside extension)', e); }
+    // initial check
+    try { if (vscode) vscode.postMessage({ command: 'checkRequirements' }); } catch (e) {}
 
-    // Expose debug helpers
-    window.__internal = {
-      connectLocalAudioWs,
-      ensureAudioPipeline,
-      createOfferTo,
-      createPeerConnection,
-      pcs,
-      combinedLocalStream,
-    };
+    window.__internal = { connectLocalAudioWs, ensureAudioPipeline, createOfferTo, createPeerConnection, pcs, combinedLocalStream };
   })();
   </script>
 </body>
@@ -953,11 +907,15 @@ function getWebviewContent(uploadedScreenshotUrl) {
 
 function deactivate() {
   if (ffmpegProcess) {
-    try { ffmpegProcess.kill("SIGINT"); } catch (e) {}
+    try {
+      ffmpegProcess.kill("SIGINT");
+    } catch (e) {}
     ffmpegProcess = null;
   }
   if (previewProcess) {
-    try { previewProcess.kill("SIGINT"); } catch (e) {}
+    try {
+      previewProcess.kill("SIGINT");
+    } catch (e) {}
     previewProcess = null;
   }
   stopLocalAudioWsServer();
