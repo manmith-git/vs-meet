@@ -761,28 +761,33 @@ function getWebviewContent() {
       // Important: do NOT create offer on new-peer (prevents glare). Joiner will create offers.
       socket.on('new-peer', ({ socketId, name }) => {
         console.log('[signal] new-peer', socketId, name);
-        addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
+        // addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
+        // Do NOT create tile now. Wait for first ontrack event.
+
       });
 
-      socket.on('signal', async ({ from, data }) => {
-        if (!pcs[from]) await createPeerConnection(from, false);
-        const pc = pcs[from];
-        if (!pc) return;
-        try {
-          if (data.type === 'offer') {
+      socket.on("signal", async ({ from, data }) => {
+    let pc = pcs[from];
+    if (!pc) pc = await createPeerConnection(from, false);
+
+    if (data.type === "offer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit("signal", { to: from, from: socket.id, data: answer });
+    }
+    else if (data.type === "answer") {
+        if (!pc.currentRemoteDescription) {
             await pc.setRemoteDescription(new RTCSessionDescription(data));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
-          } else if (data.type === 'answer') {
-            await pc.setRemoteDescription(new RTCSessionDescription(data));
-          } else if (data.candidate) {
-            try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn(e); }
-          }
-        } catch (err) {
-          console.error('[signal] process error', err);
         }
-      });
+    }
+    else if (data.candidate) {
+        if (pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+    }
+});
+
 
       socket.on('peer-left', ({ socketId }) => {
         console.log('[signal] peer-left', socketId);
@@ -791,37 +796,35 @@ function getWebviewContent() {
       });
     }
 
-    async function createPeerConnection(remoteId) {
-      if (pcs[remoteId]) return pcs[remoteId];
-      const pc = new RTCPeerConnection(pcConfig);
-      pcs[remoteId] = pc;
+    async function createPeerConnection(remoteId, initiator) {
+    const pc = new RTCPeerConnection(pcConfig);
+    pcs[remoteId] = pc;
 
-      if (combinedLocalStream) {
-        for (const t of combinedLocalStream.getTracks()) pc.addTrack(t, combinedLocalStream);
-      }
-
-      const remoteStream = new MediaStream();
-      addOrUpdateTile(remoteId, remoteStream, remoteId, false);
-
-      pc.ontrack = (ev) => {
-        ev.streams[0].getTracks().forEach(tr => remoteStream.addTrack(tr));
-        addOrUpdateTile(remoteId, remoteStream, remoteId, false);
-      };
-
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate) socket.emit('signal', { to: remoteId, from: socket.id, data: { candidate: ev.candidate } });
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (['failed','disconnected','closed'].includes(pc.connectionState)) {
-          try { pc.close(); } catch {}
-          delete pcs[remoteId];
-          removeTile(remoteId);
-        }
-      };
-
-      return pc;
+    // add local tracks
+    if (combinedLocalStream) {
+        combinedLocalStream.getTracks().forEach(t => pc.addTrack(t, combinedLocalStream));
     }
+
+    pc.ontrack = (ev) => {
+        addOrUpdateTile(remoteId, ev.streams[0], remoteId, false);
+    };
+
+    pc.onicecandidate = (ev) => {
+        if (ev.candidate) {
+            socket.emit("signal", { to: remoteId, from: socket.id, data: { candidate: ev.candidate } });
+        }
+    };
+
+    // only initiator creates offer
+    if (initiator) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit("signal", { to: remoteId, from: socket.id, data: offer });
+    }
+
+    return pc;
+}
+
 
     async function createOfferTo(remoteId) {
       const pc = await createPeerConnection(remoteId);
