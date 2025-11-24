@@ -8,28 +8,42 @@
 </head>
 <body>
   <div class="app">
-    <header>
-      <h1>VS Code Meet — Web Client</h1>
-      <p class="muted">Join a room. Use your browser camera/mic OR just receive streams from the VS Code extension.</p>
+    <header class="header">
+      <div class="header-content">
+        <h1>VS Code Meet</h1>
+        <p class="subtitle">Connect with VS Code extension users or share your camera</p>
+      </div>
     </header>
 
-    <section class="controls">
-      <input id="nameInput" placeholder="Your name" type="text" />
-      <input id="roomInput" placeholder="Room code (6 chars)" type="text" />
-      <button id="createBtn">Create room</button>
-      <button id="joinBtn">Join room</button>
-      <label class="toggle"><input id="sendMediaCheckbox" type="checkbox" checked /> Send my camera & mic</label>
-      <div style="flex:1"></div>
-      <span id="status">Not connected</span>
+    <section class="controls-panel">
+      <div class="input-group">
+        <input id="nameInput" placeholder="Your name" type="text" class="text-input" />
+        <input id="roomInput" placeholder="Room code (6 chars)" type="text" class="text-input" />
+      </div>
+      
+      <div class="button-group">
+        <button id="createBtn" class="btn btn-primary">Create Room</button>
+        <button id="joinBtn" class="btn btn-secondary">Join Room</button>
+        <button id="leaveBtn" class="btn btn-danger" style="display: none;">Leave Room</button>
+      </div>
+      
+      <div class="media-controls">
+        <label class="checkbox-label">
+          <input id="sendMediaCheckbox" type="checkbox" checked />
+          <span class="checkmark"></span>
+          Share my camera & microphone
+        </label>
+      </div>
+      
+      <div class="status-group">
+        <div id="roomInfo" class="room-info" style="display: none;"></div>
+        <div id="status" class="status">Ready to connect</div>
+      </div>
     </section>
 
-    <section id="grid" class="grid"></section>
-
-    <section class="debug card">
-      <h4>Debug / Uploaded screenshot</h4>
-      <div>Server-side path (debug): <code id="uploadedPath">/mnt/data/Screenshot 2025-11-24 084215.png</code></div>
-      <div><img id="uploadedScreenshot" src="/mnt/data/Screenshot 2025-11-24 084215.png" alt="uploaded screenshot (move file to public if you want it to load)" /></div>
-    </section>
+    <main class="main-content">
+      <section id="grid" class="video-grid"></section>
+    </main>
   </div>
 
   <script src="/socket.io/socket.io.js"></script>

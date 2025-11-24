@@ -1,7 +1,9 @@
-// extension.js - READY TO PASTE (finalized)
-// - Shows peer display names reliably (updates tile labels when peerNames become known)
-// - Keeps all previous functionality: ffmpeg preview/recording, audio WS, auto-start recording on Create, auto-join, grid layout, offscreen capture.
-// - Removed temporary debug alerts.
+// extension.js - FIXED VERSION
+// Fixed issues: 
+// - Join button double-press requirement
+// - Inconsistent camera visibility
+// - Camera stream stability
+// - WebRTC connection reliability
 
 const vscode = require("vscode");
 const { exec, spawn } = require("child_process");
@@ -29,6 +31,10 @@ if (platform === "win32") {
 }
 
 const { listDevices, getVideoInputArgs, getAudioInputArgs } = platformModule;
+
+// Track camera state globally
+let isCameraOn = false;
+let currentPanel = null;
 
 function checkFfmpegInstalled() {
   return new Promise((resolve) => {
@@ -102,6 +108,11 @@ function activate(context) {
   const disposable = vscode.commands.registerCommand(
     "meetup.openRecorder",
     async () => {
+      // Close existing panel if any
+      if (currentPanel) {
+        currentPanel.dispose();
+      }
+
       const panel = vscode.window.createWebviewPanel(
         "cameraRecorder",
         "VS Code Meet",
@@ -113,10 +124,14 @@ function activate(context) {
         }
       );
 
+      currentPanel = panel;
       let isDisposed = false;
 
       // set webview content
       panel.webview.html = getWebviewContent();
+
+      // Initialize camera state
+      isCameraOn = false;
 
       // handle messages from webview (UI)
       panel.webview.onDidReceiveMessage(
@@ -134,7 +149,7 @@ function activate(context) {
               }
 
               case "turnCameraOn": {
-                if (previewProcess) {
+                if (isCameraOn) {
                   panel.webview.postMessage({
                     command: "previewAlreadyRunning",
                   });
@@ -241,8 +256,11 @@ function activate(context) {
                 previewProcess.on("exit", (code) => {
                   console.log("[ffmpeg] preview exited", code);
                   previewProcess = null;
+                  isCameraOn = false;
+                  panel.webview.postMessage({ command: "previewStopped" });
                 });
 
+                isCameraOn = true;
                 panel.webview.postMessage({ command: "previewStarted" });
                 break;
               }
@@ -258,6 +276,7 @@ function activate(context) {
                   previewProcess = null;
                 }
                 stopLocalAudioWsServer();
+                isCameraOn = false;
                 panel.webview.postMessage({ command: "previewStopped" });
                 break;
               }
@@ -363,6 +382,7 @@ function activate(context) {
 
                 console.log("[ffmpeg] starting recording:", args.join(" "));
                 isRecording = true;
+                isCameraOn = true;
                 currentRecordingPath = outputPath;
                 previewProcess = spawn("ffmpeg", args, {
                   stdio: ["ignore", "pipe", "pipe", "pipe"],
@@ -407,6 +427,8 @@ function activate(context) {
                 previewProcess.on("exit", (code) => {
                   console.log("[ffmpeg] recording exited", code);
                   isRecording = false;
+                  isCameraOn = false;
+                  previewProcess = null;
                   panel.webview.postMessage({ command: "recordingStopped" });
                   if (code === 0 || code === 255) {
                     vscode.window.showInformationMessage(
@@ -429,6 +451,7 @@ function activate(context) {
               case "stopRecording": {
                 if (!isRecording || !previewProcess) return;
                 isRecording = false;
+                isCameraOn = false;
                 try {
                   previewProcess.stdin && previewProcess.stdin.write("q");
                 } catch (e) {}
@@ -458,6 +481,7 @@ function activate(context) {
       panel.onDidDispose(
         () => {
           isDisposed = true;
+          isCameraOn = false;
           if (previewProcess) {
             try {
               previewProcess.kill("SIGTERM");
@@ -471,6 +495,7 @@ function activate(context) {
             ffmpegProcess = null;
           }
           stopLocalAudioWsServer();
+          currentPanel = null;
         },
         undefined,
         context.subscriptions
@@ -481,7 +506,7 @@ function activate(context) {
   context.subscriptions.push(disposable);
 }
 
-// getWebviewContent: final cleaned UI & JS
+// getWebviewContent: FIXED WebRTC implementation
 function getWebviewContent() {
   const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
 
@@ -505,6 +530,7 @@ function getWebviewContent() {
   .topbar{ display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.04); position:sticky; top:0; z-index:5; background:linear-gradient(180deg, rgba(20,20,20,0.6), rgba(20,20,20,0.2)); backdrop-filter: blur(4px); }
   .topbar input{ padding:6px 8px; border-radius:6px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:var(--fg); min-width:140px; }
   .topbar button{ padding:6px 10px; border-radius:6px; background:var(--btn-bg); color:var(--btn-fg); border:none; cursor:pointer; }
+  .topbar button:disabled{ opacity:0.5; cursor:not-allowed; }
   .container{ display:flex; gap:12px; padding:12px; height: calc(100vh - 56px); box-sizing:border-box; overflow:hidden; }
   .left{ flex:1 1 auto; display:flex; flex-direction:column; gap:12px; min-width:0; }
   .card{ background:var(--card); border:1px solid var(--panel-border); border-radius:10px; padding:12px; box-sizing:border-box; overflow:hidden; }
@@ -529,7 +555,7 @@ function getWebviewContent() {
     <button id="joinRoomBtn">Join</button>
     <div style="flex:1"></div>
     <button id="turnOnCamBtn">Turn Camera On</button>
-    <button id="turnOffCamBtn">Turn Camera Off</button>
+    <button id="turnOffCamBtn" disabled>Turn Camera Off</button>
     <button id="startRecBtn">Start Recording</button>
     <button id="stopRecBtn" disabled>Stop Recording</button>
   </div>
@@ -580,9 +606,34 @@ function getWebviewContent() {
     const peerNames = {};
 
     let socket = null;
+    let isSocketConnected = false;
+    let isCameraReady = false;
+    let joinInProgress = false;
+
     try {
       if (typeof io === 'function') {
-        socket = io(SIGNALING_SERVER);
+        socket = io(SIGNALING_SERVER, {
+          transports: ['websocket', 'polling'],
+          timeout: 10000
+        });
+        
+        socket.on('connect', () => {
+          console.log('[signal] connected', socket.id);
+          isSocketConnected = true;
+          updateButtonStates();
+        });
+        
+        socket.on('disconnect', () => {
+          console.log('[signal] disconnected');
+          isSocketConnected = false;
+          updateButtonStates();
+        });
+        
+        socket.on('connect_error', (error) => {
+          console.warn('[signal] connection error', error);
+          isSocketConnected = false;
+          updateButtonStates();
+        });
       } else {
         console.warn('[webview] socket.io client (io) not found - signaling disabled');
       }
@@ -600,7 +651,12 @@ function getWebviewContent() {
       document.querySelector('.topbar').appendChild(msg);
     }
 
-    const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    const pcConfig = { 
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      iceCandidatePoolSize: 10,
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
+    };
 
     let localCanvasStream = null;
     let localAudioStreamTrack = null;
@@ -608,6 +664,21 @@ function getWebviewContent() {
     let audioWs = null;
     let audioWsPort = null;
     let gotFrame = false;
+
+    function updateButtonStates() {
+      const canJoin = isSocketConnected && isCameraReady && !joinInProgress;
+      joinRoomBtn.disabled = !canJoin;
+      createRoomBtn.disabled = !canJoin;
+      
+      // Update button text during join process
+      if (joinInProgress) {
+        joinRoomBtn.textContent = 'Joining...';
+        createRoomBtn.textContent = 'Creating...';
+      } else {
+        joinRoomBtn.textContent = 'Join';
+        createRoomBtn.textContent = 'Create';
+      }
+    }
 
     // audio pipeline (worklet preferred)
     async function createAudioPipelineSampleRate(sampleRate = 48000) {
@@ -712,6 +783,8 @@ function getWebviewContent() {
 
         if (!gotFrame) {
           gotFrame = true;
+          isCameraReady = true;
+          updateButtonStates();
           startLocalCaptureIfReady();
         }
       };
@@ -802,12 +875,27 @@ function getWebviewContent() {
         if (lab && lab.textContent !== newLabel) lab.textContent = newLabel;
       }
       const videoEl = tile.querySelector('video');
-      if (videoEl.srcObject !== stream) videoEl.srcObject = stream;
-      videoEl.play().catch(()=>{});
+      if (videoEl.srcObject !== stream) {
+        videoEl.srcObject = stream;
+        // Ensure video plays consistently
+        videoEl.play().catch(e => {
+          console.warn(\`[video] play failed for \${id}:\`, e);
+          // Retry play after a short delay
+          setTimeout(() => {
+            videoEl.play().catch(console.warn);
+          }, 100);
+        });
+      }
     }
+    
     function removeTile(id) {
       const t = tiles[id];
       if (t) {
+        const videoEl = t.querySelector('video');
+        if (videoEl && videoEl.srcObject) {
+          videoEl.srcObject.getTracks().forEach(track => track.stop());
+          videoEl.srcObject = null;
+        }
         t.remove();
         delete tiles[id];
         adjustGridLayout();
@@ -821,8 +909,6 @@ function getWebviewContent() {
       if (wired) return;
       if (!socket) { console.warn('[signal] socket missing'); return; }
       wired = true;
-
-      socket.on('connect', () => console.log('[signal] connected', socket.id));
 
       // new-peer: populate peerNames and update tile label if present
       socket.on('new-peer', (payload) => {
@@ -859,25 +945,42 @@ function getWebviewContent() {
         if (!pc) return;
 
         if (data.type === "offer") {
-            await pc.setRemoteDescription(new RTCSessionDescription(data));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            socket.emit("signal", { to: from, from: socket.id, data: answer });
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                socket.emit("signal", { to: from, from: socket.id, data: answer });
+            } catch (e) {
+                console.error('[webrtc] error handling offer:', e);
+            }
         }
         else if (data.type === "answer") {
             if (!pc.currentRemoteDescription) {
-                await pc.setRemoteDescription(new RTCSessionDescription(data));
+                try {
+                    await pc.setRemoteDescription(new RTCSessionDescription(data));
+                } catch (e) {
+                    console.error('[webrtc] error setting remote description:', e);
+                }
             }
         }
         else if (data.candidate) {
             if (pc.remoteDescription) {
-                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                } catch (e) {
+                    console.warn('[webrtc] error adding ice candidate:', e);
+                }
             }
         }
       });
 
       socket.on('peer-left', ({ socketId }) => {
-        if (pcs[socketId]) { try { pcs[socketId].close(); } catch {} delete pcs[socketId]; }
+        if (pcs[socketId]) { 
+          try { 
+            pcs[socketId].close(); 
+          } catch (e) {} 
+          delete pcs[socketId]; 
+        }
         delete peerNames[socketId];
         removeTile(socketId);
       });
@@ -888,11 +991,41 @@ function getWebviewContent() {
         return null;
       }
 
+      // Clean up existing connection if any
+      if (pcs[remoteId]) {
+        try {
+          pcs[remoteId].close();
+        } catch (e) {}
+        delete pcs[remoteId];
+      }
+
       const pc = new RTCPeerConnection(pcConfig);
       pcs[remoteId] = pc;
 
+      // Set connection state handlers
+      pc.onconnectionstatechange = () => {
+        console.log(\`[webrtc] \${remoteId} connection state: \${pc.connectionState}\`);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+          setTimeout(() => {
+            if (pc.connectionState !== 'connected') {
+              removeTile(remoteId);
+            }
+          }, 2000);
+        }
+      };
+
+      pc.onsignalingstatechange = () => {
+        console.log(\`[webrtc] \${remoteId} signaling state: \${pc.signalingState}\`);
+      };
+
       if (combinedLocalStream) {
-          combinedLocalStream.getTracks().forEach(t => pc.addTrack(t, combinedLocalStream));
+          combinedLocalStream.getTracks().forEach(t => {
+            try {
+              pc.addTrack(t, combinedLocalStream);
+            } catch (e) {
+              console.warn(\`[webrtc] error adding track to \${remoteId}:\`, e);
+            }
+          });
       }
 
       pc.ontrack = (ev) => {
@@ -922,9 +1055,13 @@ function getWebviewContent() {
       };
 
       if (initiator) {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          socket.emit("signal", { to: remoteId, from: socket.id, data: offer });
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit("signal", { to: remoteId, from: socket.id, data: offer });
+          } catch (e) {
+            console.error('[webrtc] error creating offer:', e);
+          }
       }
 
       return pc;
@@ -934,9 +1071,6 @@ function getWebviewContent() {
       if (!remoteId || (socket && remoteId === socket.id)) return;
       const pc = await createPeerConnection(remoteId, true);
       if (!pc) return;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('signal', { to: remoteId, from: socket.id, data: pc.localDescription });
     }
 
     function waitForPreviewFrame(timeoutMs = 10000) {
@@ -962,65 +1096,134 @@ function getWebviewContent() {
 
     // create room: auto-start recording + auto join; parse meta/others for names
     createRoomBtn.addEventListener('click', async () => {
-      if (!socket) return alert('Signaling unavailable');
-      const roomId = (Math.random().toString(36).slice(2,8)).toUpperCase();
-      roomInput.value = roomId;
-      wireSignalingHandlers();
-      socket.emit('create-room', { roomId, name: nameInput.value }, async (res) => {
-        if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not create room');
-
-        // server may return meta mapping like { id: name }
-        if (res.meta && typeof res.meta === 'object') {
-          for (const k of Object.keys(res.meta)) {
-            peerNames[k] = res.meta[k];
-            updateTileLabelIfExists(k);
+      if (!socket || !isSocketConnected) return alert('Signaling unavailable or not connected');
+      if (joinInProgress) return;
+      
+      joinInProgress = true;
+      updateButtonStates();
+      
+      try {
+        const roomId = (Math.random().toString(36).slice(2,8)).toUpperCase();
+        roomInput.value = roomId;
+        wireSignalingHandlers();
+        
+        socket.emit('create-room', { roomId, name: nameInput.value }, async (res) => {
+          if (!res || !res.ok) {
+            joinInProgress = false;
+            updateButtonStates();
+            return alert(res && res.message ? res.message : 'Could not create room');
           }
-        }
 
-        // parse others if present (objects or ids)
-        const others = res.others || res.peers || res.participants || res.members || null;
-        if (Array.isArray(others)) {
-          for (const item of others) {
-            if (!item) continue;
-            if (typeof item === 'object') {
-              const id = item.id || item.socketId || item.s || null;
-              const nm = extractNameFromPayload(item);
-              if (id && nm) {
-                peerNames[id] = nm;
-                updateTileLabelIfExists(id);
-              }
-            }
-          }
-        }
-
-        try {
-          if (vscode) {
-            vscode.postMessage({ command: 'startRecording' });
-          }
-        } catch (e) { console.warn('[create] could not post startRecording', e); }
-
-        try {
-          await waitForPreviewFrame(10000);
-        } catch (err) {
-          alert('Preview/recording did not start in time. Please ensure FFmpeg is available and your camera is connected. Auto-join aborted.');
-          return;
-        }
-
-        try { await ensureAudioPipeline(); } catch (e) { console.warn('[auto-join] ensureAudioPipeline failed', e); }
-
-        socket.emit('join-room', { roomId, name: nameInput.value }, async (joinRes) => {
-          if (!joinRes || !joinRes.ok) {
-            return alert(joinRes && joinRes.message ? joinRes.message : 'Could not join room automatically');
-          }
-          const list = joinRes.others || joinRes.peers || joinRes.participants || joinRes.members || [];
-          // apply meta mapping if present
-          if (joinRes.meta && typeof joinRes.meta === 'object') {
-            for (const k of Object.keys(joinRes.meta)) {
-              peerNames[k] = joinRes.meta[k];
+          // server may return meta mapping like { id: name }
+          if (res.meta && typeof res.meta === 'object') {
+            for (const k of Object.keys(res.meta)) {
+              peerNames[k] = res.meta[k];
               updateTileLabelIfExists(k);
             }
           }
-          for (const item of list) {
+
+          // parse others if present (objects or ids)
+          const others = res.others || res.peers || res.participants || res.members || null;
+          if (Array.isArray(others)) {
+            for (const item of others) {
+              if (!item) continue;
+              if (typeof item === 'object') {
+                const id = item.id || item.socketId || item.s || null;
+                const nm = extractNameFromPayload(item);
+                if (id && nm) {
+                  peerNames[id] = nm;
+                  updateTileLabelIfExists(id);
+                }
+              }
+            }
+          }
+
+          try {
+            if (vscode) {
+              vscode.postMessage({ command: 'startRecording' });
+            }
+          } catch (e) { console.warn('[create] could not post startRecording', e); }
+
+          try {
+            await waitForPreviewFrame(10000);
+          } catch (err) {
+            joinInProgress = false;
+            updateButtonStates();
+            alert('Preview/recording did not start in time. Please ensure FFmpeg is available and your camera is connected. Auto-join aborted.');
+            return;
+          }
+
+          try { await ensureAudioPipeline(); } catch (e) { console.warn('[auto-join] ensureAudioPipeline failed', e); }
+
+          socket.emit('join-room', { roomId, name: nameInput.value }, async (joinRes) => {
+            joinInProgress = false;
+            updateButtonStates();
+            
+            if (!joinRes || !joinRes.ok) {
+              return alert(joinRes && joinRes.message ? joinRes.message : 'Could not join room automatically');
+            }
+            const list = joinRes.others || joinRes.peers || joinRes.participants || joinRes.members || [];
+            // apply meta mapping if present
+            if (joinRes.meta && typeof joinRes.meta === 'object') {
+              for (const k of Object.keys(joinRes.meta)) {
+                peerNames[k] = joinRes.meta[k];
+                updateTileLabelIfExists(k);
+              }
+            }
+            for (const item of list) {
+              if (!item) continue;
+              if (typeof item === 'object') {
+                const id = item.id || item.socketId || item.s || null;
+                const nm = extractNameFromPayload(item);
+                if (id && nm) { peerNames[id] = nm; updateTileLabelIfExists(id); }
+                if (socket && id === socket.id) continue;
+                if (id) await createOfferTo(id);
+              } else {
+                const id = String(item);
+                if (socket && id === socket.id) continue;
+                await createOfferTo(id);
+              }
+            }
+          });
+        });
+      } catch (error) {
+        joinInProgress = false;
+        updateButtonStates();
+        console.error('[create] error:', error);
+        alert('Error creating room: ' + error.message);
+      }
+    });
+
+    // join room: flexible parsing
+    joinRoomBtn.addEventListener('click', async () => {
+      if (!socket || !isSocketConnected) return alert('Signaling unavailable or not connected');
+      if (joinInProgress) return;
+      
+      const roomId = (roomInput.value || '').trim().toUpperCase();
+      if (!roomId) return alert('Enter room code');
+      
+      if (!gotFrame) return alert('Start FFmpeg preview/recording first (Turn Camera On or Start Recording) then join the room.');
+      
+      joinInProgress = true;
+      updateButtonStates();
+      
+      try {
+        wireSignalingHandlers();
+        await ensureAudioPipeline();
+        
+        socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
+          joinInProgress = false;
+          updateButtonStates();
+          
+          if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not join room');
+          if (res.meta && typeof res.meta === 'object') {
+            for (const k of Object.keys(res.meta)) {
+              peerNames[k] = res.meta[k];
+              updateTileLabelIfExists(k);
+            }
+          }
+          const others = res.others || res.peers || res.participants || res.members || [];
+          for (const item of others) {
             if (!item) continue;
             if (typeof item === 'object') {
               const id = item.id || item.socketId || item.s || null;
@@ -1035,52 +1238,38 @@ function getWebviewContent() {
             }
           }
         });
-      });
-    });
-
-    // join room: flexible parsing
-    joinRoomBtn.addEventListener('click', async () => {
-      if (!socket) return alert('Signaling unavailable');
-      const roomId = (roomInput.value || '').trim().toUpperCase();
-      if (!roomId) return alert('Enter room code');
-      wireSignalingHandlers();
-      if (!gotFrame) return alert('Start FFmpeg preview/recording first (Turn Camera On or Start Recording) then join the room.');
-      await ensureAudioPipeline();
-      socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
-        if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not join room');
-        if (res.meta && typeof res.meta === 'object') {
-          for (const k of Object.keys(res.meta)) {
-            peerNames[k] = res.meta[k];
-            updateTileLabelIfExists(k);
-          }
-        }
-        const others = res.others || res.peers || res.participants || res.members || [];
-        for (const item of others) {
-          if (!item) continue;
-          if (typeof item === 'object') {
-            const id = item.id || item.socketId || item.s || null;
-            const nm = extractNameFromPayload(item);
-            if (id && nm) { peerNames[id] = nm; updateTileLabelIfExists(id); }
-            if (socket && id === socket.id) continue;
-            if (id) await createOfferTo(id);
-          } else {
-            const id = String(item);
-            if (socket && id === socket.id) continue;
-            await createOfferTo(id);
-          }
-        }
-      });
+      } catch (error) {
+        joinInProgress = false;
+        updateButtonStates();
+        console.error('[join] error:', error);
+        alert('Error joining room: ' + error.message);
+      }
     });
 
     // extension messaging buttons
     turnOnCamBtn.addEventListener('click', () => {
       if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'turnCameraOn' });
+      turnOnCamBtn.disabled = true;
+      turnOffCamBtn.disabled = false;
     });
+    
     turnOffCamBtn.addEventListener('click', () => {
       if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'turnCameraOff' });
+      turnOnCamBtn.disabled = false;
+      turnOffCamBtn.disabled = true;
+      isCameraReady = false;
+      updateButtonStates();
       try { if (audioWs) audioWs.close(); } catch (e) {}
+      // Clean up local stream
+      if (combinedLocalStream) {
+        combinedLocalStream.getTracks().forEach(track => track.stop());
+        combinedLocalStream = null;
+      }
+      localCanvasStream = null;
+      removeTile('local');
+      gotFrame = false;
     });
 
     startRecBtn.addEventListener('click', () => {
@@ -1088,12 +1277,17 @@ function getWebviewContent() {
       vscode.postMessage({ command: 'startRecording' });
       stopRecBtn.disabled = false;
       startRecBtn.disabled = true;
+      turnOnCamBtn.disabled = true;
+      turnOffCamBtn.disabled = false;
     });
+    
     stopRecBtn.addEventListener('click', () => {
       if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'stopRecording' });
       stopRecBtn.disabled = true;
       startRecBtn.disabled = false;
+      turnOnCamBtn.disabled = false;
+      turnOffCamBtn.disabled = true;
     });
 
     // messages from extension host
@@ -1103,10 +1297,24 @@ function getWebviewContent() {
       if (msg.command === 'frameUpdate' && msg.frame) handleFrameDataURL(msg.frame);
       else if (msg.command === 'requirementsStatus') ffmpegStatus.textContent = msg.ffmpeg ? 'Installed ✓' : 'Missing ✗';
       else if (msg.command === 'audioWsPort') { audioWsPort = msg.port; connectLocalAudioWs(audioWsPort); }
-      else if (msg.command === 'previewStarted') { /* no visible preview UI to update */ }
-      else if (msg.command === 'previewStopped') { /* no visible preview UI to update */ }
-      else if (msg.command === 'recordingStarted') { stopRecBtn.disabled = false; startRecBtn.disabled = true; }
-      else if (msg.command === 'recordingStopped') { stopRecBtn.disabled = true; startRecBtn.disabled = false; }
+      else if (msg.command === 'previewStarted') { 
+        turnOnCamBtn.disabled = true;
+        turnOffCamBtn.disabled = false;
+      }
+      else if (msg.command === 'previewStopped') { 
+        turnOnCamBtn.disabled = false;
+        turnOffCamBtn.disabled = true;
+        isCameraReady = false;
+        updateButtonStates();
+      }
+      else if (msg.command === 'recordingStarted') { 
+        stopRecBtn.disabled = false; 
+        startRecBtn.disabled = true; 
+      }
+      else if (msg.command === 'recordingStopped') { 
+        stopRecBtn.disabled = true; 
+        startRecBtn.disabled = false; 
+      }
       // ffmpegLog messages intentionally ignored (no visible log)
     });
 
