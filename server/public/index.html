@@ -2,53 +2,36 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>VS Code Meet – Web Client</title>
+  <title>VS Code Meet — Web Client</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <style>
-    html,body { height:100%; margin:0; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; background:#050505; color:#fff; }
-    .app { max-width:1100px; margin:0 auto; padding:16px; }
-    h1 { font-size:22px; margin-bottom:4px; }
-    p { font-size:13px; color:#bbb; margin-top:0; }
-    .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:16px 0 8px; }
-    input[type=text]{ padding:8px; font-size:14px; border-radius:6px; border:1px solid #333; background:#111; color:#fff; }
-    button{ padding:8px 12px; font-size:14px; border-radius:6px; border:none; cursor:pointer; background:#2563eb; color:#fff; }
-    button:hover{ background:#1d4ed8; }
-    #status{ font-size:13px; color:#aaa; margin-bottom:8px; }
-    #grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
-    .tile{ background:#111; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }
-    video{ width:100%; height:160px; object-fit:cover; background:#000; }
-    .label{ padding:6px 8px; font-size:12px; text-align:center; }
-    .meta { font-size:12px; color:#888; margin-top:8px; }
-    #uploadedScreenshot { width:100%; max-height:140px; object-fit:cover; border-radius:6px; margin-top:8px; }
-  </style>
+  <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <div class="app">
-    <h1>VS Code Meet – Web Client</h1>
-    <p>Join your VS Code room from the browser. Works with extension users streaming FFmpeg video+audio.</p>
+    <header>
+      <h1>VS Code Meet — Web Client</h1>
+      <p class="muted">Join a room. Use your browser camera/mic OR just receive streams from the VS Code extension.</p>
+    </header>
 
-    <div class="controls">
+    <section class="controls">
       <input id="nameInput" placeholder="Your name" type="text" />
       <input id="roomInput" placeholder="Room code (6 chars)" type="text" />
       <button id="createBtn">Create room</button>
       <button id="joinBtn">Join room</button>
+      <label class="toggle"><input id="sendMediaCheckbox" type="checkbox" checked /> Send my camera & mic</label>
       <div style="flex:1"></div>
-      <span id="status">Not connected.</span>
-    </div>
+      <span id="status">Not connected</span>
+    </section>
 
-    <div id="grid"></div>
+    <section id="grid" class="grid"></section>
 
-    <div class="meta">
-      <div>Debug: uploaded screenshot path (from system):</div>
-      <code id="uploadedPath">/mnt/data/Screenshot 2025-11-24 084215.png</code>
-      <div>
-        <img id="uploadedScreenshot" src="/mnt/data/Screenshot 2025-11-24 084215.png" alt="uploaded screenshot (path shown above)" />
-      </div>
-      <div class="meta">Note: move the screenshot into your server `public/` folder (e.g. `public/uploads/screenshot.png`) and update the <code>src</code> if you want it to load in the browser.</div>
-    </div>
+    <section class="debug card">
+      <h4>Debug / Uploaded screenshot</h4>
+      <div>Server-side path (debug): <code id="uploadedPath">/mnt/data/Screenshot 2025-11-24 084215.png</code></div>
+      <div><img id="uploadedScreenshot" src="/mnt/data/Screenshot 2025-11-24 084215.png" alt="uploaded screenshot (move file to public if you want it to load)" /></div>
+    </section>
   </div>
 
-  <!-- socket.io client script will be served by the same server -->
   <script src="/socket.io/socket.io.js"></script>
   <script src="/client.js"></script>
 </body>

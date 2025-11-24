@@ -1,25 +1,32 @@
-// client.js - web client for VS Code Meet (mesh WebRTC)
+// public/client.js
+// Simple mesh WebRTC client that can (A) send browser camera+mic OR (B) be receive-only.
+// Connects to the signaling server (same origin).
 (function () {
-  const SIGNALING = '/'; // socket.io served from same origin (the Render app)
-  const socket = io();
+  const socket = io(); // served from same origin (Render) at /socket.io
+
+  // Config: add TURN servers here if needed
+  const PC_CONFIG = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+      // { urls: 'turn:YOUR_TURN_HOST:3478', username: 'user', credential: 'pass' }
+    ]
+  };
 
   const nameInput = document.getElementById('nameInput');
   const roomInput = document.getElementById('roomInput');
   const createBtn = document.getElementById('createBtn');
   const joinBtn = document.getElementById('joinBtn');
-  const statusEl = document.getElementById('status');
   const grid = document.getElementById('grid');
-
-  const pcConfig = {
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-  };
+  const statusEl = document.getElementById('status');
+  const sendMediaCheckbox = document.getElementById('sendMediaCheckbox');
 
   let localStream = null;
-  const pcs = {}; // remoteId -> pc
-  const tiles = {}; // remoteId -> tile
+  const pcs = {};       // peerId -> RTCPeerConnection
+  const tiles = {};     // peerId -> DOM tile
 
   function setStatus(t) { statusEl.textContent = t; }
 
+  // Create or update a video tile for a stream
   function addOrUpdateTile(id, stream, label, isLocal) {
     let tile = tiles[id];
     if (!tile) {
@@ -29,6 +36,7 @@
       video.autoplay = true;
       video.playsInline = true;
       video.muted = !!isLocal;
+      video.width = 320;
       tile.appendChild(video);
       const lab = document.createElement('div');
       lab.className = 'label';
@@ -37,41 +45,48 @@
       grid.appendChild(tile);
       tiles[id] = tile;
     }
-    const video = tile.querySelector('video');
-    video.srcObject = stream;
+    const v = tile.querySelector('video');
+    if (v.srcObject !== stream) v.srcObject = stream;
+    // attempt to play (autoplay policies may block until user gesture)
+    v.play().catch(e => { /* ignore autoplay block */ });
   }
 
   function removeTile(id) {
-    const tile = tiles[id];
-    if (!tile) return;
-    tile.remove();
+    const t = tiles[id];
+    if (!t) return;
+    t.remove();
     delete tiles[id];
   }
 
-  async function getLocalMedia() {
+  // Acquire local camera+mic if user checked checkbox
+  async function ensureLocalMedia() {
+    if (!sendMediaCheckbox.checked) return null;
     if (localStream) return localStream;
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStream = s;
       addOrUpdateTile('local', localStream, nameInput.value || 'Me (browser)', true);
       return localStream;
     } catch (e) {
+      console.error('getUserMedia failed', e);
       alert('Could not access camera/microphone: ' + e.message);
       throw e;
     }
   }
 
+  // Wiring socket handlers
   let wired = false;
-  function wireSocketHandlers() {
+  function wireSocket() {
     if (wired) return;
     wired = true;
 
     socket.on('connect', () => {
-      setStatus('Connected to signaling server');
+      setStatus('Connected to signaling: ' + socket.id);
       console.log('socket connected', socket.id);
     });
 
     socket.on('new-peer', async ({ socketId, name }) => {
-      setStatus('New peer joined: ' + (name || socketId));
+      console.log('new-peer', socketId, name);
       addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
       await createOfferTo(socketId);
     });
@@ -79,75 +94,98 @@
     socket.on('signal', async ({ from, data }) => {
       if (!pcs[from]) await createPeerConnection(from, false);
       const pc = pcs[from];
-      if (!pc) return;
-      if (data.type === 'offer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(data));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
-      } else if (data.type === 'answer') {
-        await pc.setRemoteDescription(new RTCSessionDescription(data));
-      } else if (data.candidate) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(data.candidate)); } catch (e) { console.warn('candidate err', e); }
+      if (!pc) return console.warn('signal for unknown pc', from);
+      console.log('signal received from', from, data.type || 'candidate');
+      try {
+        if (data.type === 'offer') {
+          await pc.setRemoteDescription(data);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('signal', { to: from, from: socket.id, data: pc.localDescription });
+        } else if (data.type === 'answer') {
+          await pc.setRemoteDescription(data);
+        } else if (data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+      } catch (err) {
+        console.error('Error processing signal', err);
       }
     });
 
     socket.on('peer-left', ({ socketId }) => {
-      setStatus('Peer left: ' + socketId);
+      console.log('peer left', socketId);
       if (pcs[socketId]) { try { pcs[socketId].close(); } catch {} delete pcs[socketId]; }
       removeTile(socketId);
     });
+
+    socket.on('room-meta', ({ meta }) => {
+      // Optionally update labels (if you want)
+      Object.entries(meta || {}).forEach(([id, name]) => {
+        const tile = tiles[id];
+        if (tile) tile.querySelector('.label').textContent = name;
+      });
+    });
   }
 
-  async function createPeerConnection(remoteId) {
-    if (pcs[remoteId]) return pcs[remoteId];
-    const pc = new RTCPeerConnection(pcConfig);
-    pcs[remoteId] = pc;
+  async function createPeerConnection(peerId) {
+    if (pcs[peerId]) return pcs[peerId];
+    const pc = new RTCPeerConnection(PC_CONFIG);
+    pcs[peerId] = pc;
 
-    // add local tracks
+    // add local tracks (if present) BEFORE creating offer
     if (localStream) {
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
     }
 
+    // remote stream collector
     const remoteStream = new MediaStream();
-    addOrUpdateTile(remoteId, remoteStream, remoteId, false);
+    addOrUpdateTile(peerId, remoteStream, peerId, false);
 
     pc.ontrack = (ev) => {
       ev.streams[0].getTracks().forEach(tr => remoteStream.addTrack(tr));
-      addOrUpdateTile(remoteId, remoteStream, remoteId, false);
+      addOrUpdateTile(peerId, remoteStream, peerId, false);
     };
 
     pc.onicecandidate = (ev) => {
       if (ev.candidate) {
-        socket.emit('signal', { to: remoteId, from: socket.id, data: { candidate: ev.candidate } });
+        socket.emit('signal', { to: peerId, from: socket.id, data: { candidate: ev.candidate } });
       }
     };
 
     pc.onconnectionstatechange = () => {
-      if (['failed','disconnected','closed'].includes(pc.connectionState)) {
+      console.log('pc state', peerId, pc.connectionState);
+      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
         try { pc.close(); } catch (e) {}
-        delete pcs[remoteId];
-        removeTile(remoteId);
+        delete pcs[peerId];
+        removeTile(peerId);
       }
     };
 
     return pc;
   }
 
-  async function createOfferTo(remoteId) {
-    const pc = await createPeerConnection(remoteId);
+  async function createOfferTo(peerId) {
+    const pc = await createPeerConnection(peerId);
+    // ensure local tracks exist (in case user enabled them after pc created)
+    if (!localStream && sendMediaCheckbox.checked) {
+      await ensureLocalMedia();
+      if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
+
+    console.log('creating offer to', peerId);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    socket.emit('signal', { to: remoteId, from: socket.id, data: pc.localDescription });
+    socket.emit('signal', { to: peerId, from: socket.id, data: pc.localDescription });
   }
 
+  // UI button handlers
   createBtn.onclick = async () => {
     const roomId = (Math.random().toString(36).slice(2,8)).toUpperCase();
     roomInput.value = roomId;
     try {
-      await getLocalMedia();
-    } catch (_) { return; }
-    wireSocketHandlers();
+      await ensureLocalMedia(); // optional; if unchecked it'll still create room but not send tracks
+    } catch (e) { /* user denied */ }
+    wireSocket();
     socket.emit('create-room', { roomId, name: nameInput.value }, (res) => {
       if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not create room');
       setStatus('Created room ' + roomId);
@@ -156,21 +194,31 @@
 
   joinBtn.onclick = async () => {
     const roomId = (roomInput.value || '').trim().toUpperCase();
-    if (!roomId) return alert('Enter room code to join');
+    if (!roomId) return alert('Enter room code');
     try {
-      await getLocalMedia();
-    } catch (_) { return; }
-    wireSocketHandlers();
+      await ensureLocalMedia();
+    } catch (e) { /* user denied; still allow join if unchecked */ }
+    wireSocket();
     socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
       if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not join room');
-      setStatus('Joined room ' + roomId);
+      setStatus('Joined ' + roomId);
       const others = res.others || [];
-      for (const id of others) await createOfferTo(id);
+      // create offers to existing peers
+      for (const id of others) {
+        await createOfferTo(id);
+      }
     });
   };
 
-  // expose for debugging
-  window.__vc = { socket, pcs, tiles };
+  // Clean up before unload
+  window.addEventListener('beforeunload', () => {
+    try {
+      socket.disconnect();
+    } catch (e) {}
+  });
+
+  // expose for debug
+  window.__client = { socket, pcs, tiles };
 
   setStatus('Ready');
 })();
