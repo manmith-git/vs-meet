@@ -1,4 +1,8 @@
-// extension.js - CLEAN FIXED VERSION (screenshot removed)
+// extension.js - READY TO PASTE (finalized)
+// - Shows peer display names reliably (updates tile labels when peerNames become known)
+// - Keeps all previous functionality: ffmpeg preview/recording, audio WS, auto-start recording on Create, auto-join, grid layout, offscreen capture.
+// - Removed temporary debug alerts.
+
 const vscode = require("vscode");
 const { exec, spawn } = require("child_process");
 const path = require("path");
@@ -111,7 +115,7 @@ function activate(context) {
 
       let isDisposed = false;
 
-      // set webview content (no screenshot to avoid interpolation issues)
+      // set webview content
       panel.webview.html = getWebviewContent();
 
       // handle messages from webview (UI)
@@ -230,8 +234,8 @@ function activate(context) {
                 }
 
                 previewProcess.stderr.on("data", (d) => {
-                  const s = d.toString();
-                  panel.webview.postMessage({ command: "ffmpegLog", text: s });
+                  // forward ffmpeg stderr to webview (webview may ignore or log)
+                  panel.webview.postMessage({ command: "ffmpegLog", text: d.toString() });
                 });
 
                 previewProcess.on("exit", (code) => {
@@ -364,7 +368,7 @@ function activate(context) {
                   stdio: ["ignore", "pipe", "pipe", "pipe"],
                 });
 
-                // frames for preview
+                // frames for preview (still used for offscreen canvas)
                 let frameBuf = Buffer.alloc(0);
                 const JPEG_S = Buffer.from([0xff, 0xd8]);
                 const JPEG_E = Buffer.from([0xff, 0xd9]);
@@ -477,9 +481,8 @@ function activate(context) {
   context.subscriptions.push(disposable);
 }
 
-// getWebviewContent (NO screenshot)
+// getWebviewContent: final cleaned UI & JS
 function getWebviewContent() {
-  // signaling server URL (your render instance)
   const SIGNALING_SERVER = "https://voice-collab-room.onrender.com";
 
   return `<!doctype html>
@@ -489,22 +492,33 @@ function getWebviewContent() {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>VS Code Meet — WebView</title>
 <style>
-  :root { --bg: var(--vscode-editor-background); --fg: var(--vscode-foreground); }
-  body{ font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial; background:var(--bg); color:var(--fg); margin:0; padding:0; }
-  .topbar{ display:flex; align-items:center; gap:8px; padding:10px; border-bottom:1px solid rgba(255,255,255,0.04); }
-  .topbar input{ padding:6px 8px; border-radius:6px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:var(--fg); }
-  .topbar button{ padding:6px 10px; border-radius:6px; background:var(--vscode-button-background); color:var(--vscode-button-foreground); border:none; cursor:pointer;}
-  .container{ display:flex; gap:12px; padding:12px; height: calc(100vh - 56px); box-sizing:border-box; }
-  .left{ flex:2; display:flex; flex-direction:column; gap:12px; overflow:auto; }
-  .right{ width:320px; display:flex; flex-direction:column; gap:12px; }
-  .card{ background:var(--vscode-sideBar-background); border:1px solid var(--vscode-panel-border); border-radius:10px; padding:12px; }
-  #previewCanvas{ width:100%; background:#000; border-radius:8px; display:block; }
-  .video-grid{ display:grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr)); gap:8px; margin-top:8px; }
-  .video-tile{ background:#111; border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
-  .video-tile video{ width:100%; height:140px; object-fit:cover; background:#000; }
-  .video-label{ padding:6px 8px; font-size:12px; color:#fff; text-align:center; background:rgba(0,0,0,0.6); }
-  .status{ font-size:13px; color:var(--vscode-descriptionForeground); margin-top:6px;}
+  :root {
+    --bg: var(--vscode-editor-background);
+    --fg: var(--vscode-foreground);
+    --muted: var(--vscode-descriptionForeground);
+    --card: var(--vscode-sideBar-background);
+    --panel-border: var(--vscode-panel-border);
+    --btn-bg: var(--vscode-button-background);
+    --btn-fg: var(--vscode-button-foreground);
+  }
+  html,body{ height:100%; margin:0; padding:0; font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial; background:var(--bg); color:var(--fg); }
+  .topbar{ display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid rgba(255,255,255,0.04); position:sticky; top:0; z-index:5; background:linear-gradient(180deg, rgba(20,20,20,0.6), rgba(20,20,20,0.2)); backdrop-filter: blur(4px); }
+  .topbar input{ padding:6px 8px; border-radius:6px; border:1px solid rgba(255,255,255,0.06); background:transparent; color:var(--fg); min-width:140px; }
+  .topbar button{ padding:6px 10px; border-radius:6px; background:var(--btn-bg); color:var(--btn-fg); border:none; cursor:pointer; }
+  .container{ display:flex; gap:12px; padding:12px; height: calc(100vh - 56px); box-sizing:border-box; overflow:hidden; }
+  .left{ flex:1 1 auto; display:flex; flex-direction:column; gap:12px; min-width:0; }
+  .card{ background:var(--card); border:1px solid var(--panel-border); border-radius:10px; padding:12px; box-sizing:border-box; overflow:hidden; }
+  .participants-card{ display:flex; flex-direction:column; height:100%; min-height:0; }
+  .video-grid{ display:grid; gap:10px; grid-template-columns: repeat(1, 1fr); align-content:start; width:100%; padding:6px; box-sizing:border-box; overflow:auto; }
+  .video-tile{ background: #0b0b0b; border-radius:10px; overflow:hidden; position:relative; display:flex; flex-direction:column; align-items:stretch; justify-content:center; aspect-ratio: 16 / 9; min-height: 80px; box-shadow: 0 1px 0 rgba(0,0,0,0.4) inset; }
+  .video-tile video{ width:100%; height:100%; object-fit:cover; display:block; background:#000; }
+  .video-label{ position:absolute; left:8px; bottom:8px; padding:4px 8px; font-size:12px; color:#fff; background:linear-gradient(90deg, rgba(0,0,0,0.6), rgba(0,0,0,0.3)); border-radius:6px; backdrop-filter: blur(2px); }
+  .right{ width:320px; display:flex; flex-direction:column; gap:12px; min-width:220px; }
+  .status{ font-size:13px; color:var(--muted); margin-top:6px; }
   .small { font-size:12px; color: #bbb; word-break:break-all; }
+  @media (max-width:900px){ .container{ flex-direction:column; height: calc(100vh - 56px); overflow:auto; } .right{ width:100%; } }
+  .video-grid::-webkit-scrollbar{ height:8px; width:8px; }
+  .video-grid::-webkit-scrollbar-thumb{ background: rgba(255,255,255,0.06); border-radius:8px; }
 </style>
 </head>
 <body>
@@ -522,41 +536,30 @@ function getWebviewContent() {
 
   <div class="container">
     <div class="left">
-      <div class="card">
-        <h3>Preview</h3>
-        <canvas id="previewCanvas" width="640" height="360"></canvas>
-        <div id="previewPlaceholder" class="status">Waiting for FFmpeg preview...</div>
-        <pre id="ffmpegLog" class="status small" style="max-height:120px; overflow:auto;"></pre>
-      </div>
-
-      <div class="card">
-        <h3>Participants</h3>
-        <div id="videoGrid" class="video-grid"></div>
+      <div class="card participants-card" style="flex:1; min-height:0;">
+        <h3 style="margin:0 0 8px 0">Participants</h3>
+        <div id="videoGrid" class="video-grid" role="list" aria-label="Video tiles"></div>
       </div>
     </div>
 
     <div class="right">
       <div class="card">
-        <h3>Requirements</h3>
+        <h3 style="margin:0 0 8px 0">Requirements</h3>
         <div>FFmpeg status: <span id="ffmpegStatus">Checking...</span></div>
       </div>
 
       <div class="card">
-        <h3>Info</h3>
-        <div class="small">Screenshot card removed (Option A)</div>
+        <h3 style="margin:0 0 8px 0">Info</h3>
+        <div class="small">Preview removed from UI. Offscreen capture continues to work.</div>
       </div>
     </div>
   </div>
 
-  <!-- socket.io from your signaling server -->
   <script src="${SIGNALING_SERVER}/socket.io/socket.io.js"></script>
 
   <script>
   (function () {
-    // Ensure vscode messaging is available inside webview
     const vscode = (typeof acquireVsCodeApi === 'function') ? acquireVsCodeApi() : null;
-
-    // Config
     const SIGNALING_SERVER = "${SIGNALING_SERVER}";
     const nameInput = document.getElementById('nameInput');
     const roomInput = document.getElementById('roomInput');
@@ -566,16 +569,16 @@ function getWebviewContent() {
     const turnOffCamBtn = document.getElementById('turnOffCamBtn');
     const startRecBtn = document.getElementById('startRecBtn');
     const stopRecBtn = document.getElementById('stopRecBtn');
-    const previewCanvas = document.getElementById('previewCanvas');
-    const previewPlaceholder = document.getElementById('previewPlaceholder');
-    const ffmpegLog = document.getElementById('ffmpegLog');
     const videoGrid = document.getElementById('videoGrid');
     const ffmpegStatus = document.getElementById('ffmpegStatus');
 
-    const ctx = previewCanvas.getContext('2d');
+    const offscreenCanvas = document.createElement('canvas');
+    const ctxOff = offscreenCanvas.getContext('2d');
     const devicePixel = window.devicePixelRatio || 1;
 
-    // safe socket creation
+    // map socketId -> displayName
+    const peerNames = {};
+
     let socket = null;
     try {
       if (typeof io === 'function') {
@@ -599,7 +602,6 @@ function getWebviewContent() {
 
     const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-    // local capture vars
     let localCanvasStream = null;
     let localAudioStreamTrack = null;
     let combinedLocalStream = null;
@@ -607,7 +609,7 @@ function getWebviewContent() {
     let audioWsPort = null;
     let gotFrame = false;
 
-    // audio pipeline (AudioWorklet preferred)
+    // audio pipeline (worklet preferred)
     async function createAudioPipelineSampleRate(sampleRate = 48000) {
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
       const workletCode = \`
@@ -699,16 +701,17 @@ function getWebviewContent() {
       audioWs.onerror = (e) => console.warn('[audio-ws] error', e);
     }
 
+    // draw incoming base64 frames into offscreen canvas
     function handleFrameDataURL(dataUrl) {
       const img = new Image();
       img.onload = () => {
-        const targetW = previewCanvas.clientWidth;
-        previewCanvas.width = targetW * devicePixel;
-        previewCanvas.height = (previewCanvas.width * img.height / img.width) | 0;
-        ctx.drawImage(img, 0, 0, previewCanvas.width, previewCanvas.height);
+        const targetW = img.width || 640;
+        offscreenCanvas.width = targetW * devicePixel;
+        offscreenCanvas.height = (offscreenCanvas.width * img.height / img.width) | 0;
+        ctxOff.drawImage(img, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
+
         if (!gotFrame) {
           gotFrame = true;
-          previewPlaceholder.style.display = 'none';
           startLocalCaptureIfReady();
         }
       };
@@ -717,7 +720,12 @@ function getWebviewContent() {
 
     async function startLocalCaptureIfReady() {
       if (localCanvasStream) return;
-      localCanvasStream = previewCanvas.captureStream(30);
+      try {
+        localCanvasStream = offscreenCanvas.captureStream(30);
+      } catch (e) {
+        console.warn('[capture] offscreen captureStream failed', e);
+        return;
+      }
       const pipeline = await ensureAudioPipeline();
       const audioDestStream = pipeline.destination.stream || pipeline.destination;
       const audioTrack = audioDestStream.getAudioTracks()[0];
@@ -729,25 +737,83 @@ function getWebviewContent() {
       addOrUpdateTile('local', combinedLocalStream, nameInput.value || 'Me (VS Code)', true);
     }
 
+    // tiles and grid
     const tiles = {};
+    function adjustGridLayout() {
+      const ids = Object.keys(tiles);
+      const n = ids.length || 1;
+      const cols = Math.ceil(Math.sqrt(n));
+      videoGrid.style.gridTemplateColumns = 'repeat(' + cols + ', 1fr)';
+    }
+
+    // flexible extraction of display name fields
+    function extractNameFromPayload(obj) {
+      if (!obj) return null;
+      if (typeof obj === 'string') return null;
+      return (
+        obj.name ||
+        obj.displayName ||
+        obj.username ||
+        obj.label ||
+        (obj.meta && (obj.meta.name || obj.meta.displayName)) ||
+        null
+      );
+    }
+
+    // compute label, prefer peerNames map
+    function computeLabel(passedLabel, id) {
+      if (peerNames[id]) return peerNames[id];
+      if (passedLabel && passedLabel !== id) return String(passedLabel).trim();
+      if (id && id.length > 4) return 'Guest-' + id.slice(0,4);
+      return passedLabel || id || 'Guest';
+    }
+
+    // update tile label if tile exists
+    function updateTileLabelIfExists(id) {
+      const tile = tiles[id];
+      if (!tile) return;
+      const lab = tile.querySelector('.video-label');
+      const newLabel = computeLabel(null, id);
+      if (lab && lab.textContent !== newLabel) lab.textContent = newLabel;
+    }
+
     function addOrUpdateTile(id, stream, label, isLocal) {
+      // don't create remote tile for our own socket id
+      if (socket && id === socket.id && !isLocal) return;
+
+      const hasTracks = stream && ((stream.getVideoTracks && stream.getVideoTracks().length) || (stream.getAudioTracks && stream.getAudioTracks().length));
+      if (!isLocal && !hasTracks) return;
+
       let tile = tiles[id];
       if (!tile) {
         tile = document.createElement('div'); tile.className = 'video-tile';
         const v = document.createElement('video'); v.autoplay = true; v.playsInline = true; v.muted = !!isLocal;
+        v.setAttribute('data-peer-id', id);
         tile.appendChild(v);
-        const lab = document.createElement('div'); lab.className = 'video-label'; lab.textContent = label || id;
+        const lab = document.createElement('div'); lab.className = 'video-label';
+        lab.textContent = computeLabel(label, id);
         tile.appendChild(lab);
         videoGrid.appendChild(tile);
         tiles[id] = tile;
+        adjustGridLayout();
+      } else {
+        const lab = tile.querySelector('.video-label');
+        const newLabel = computeLabel(label, id);
+        if (lab && lab.textContent !== newLabel) lab.textContent = newLabel;
       }
       const videoEl = tile.querySelector('video');
       if (videoEl.srcObject !== stream) videoEl.srcObject = stream;
       videoEl.play().catch(()=>{});
     }
-    function removeTile(id) { const t = tiles[id]; if (t) { t.remove(); delete tiles[id]; } }
+    function removeTile(id) {
+      const t = tiles[id];
+      if (t) {
+        t.remove();
+        delete tiles[id];
+        adjustGridLayout();
+      }
+    }
 
-    // WebRTC mesh
     const pcs = {};
     let wired = false;
 
@@ -758,108 +824,255 @@ function getWebviewContent() {
 
       socket.on('connect', () => console.log('[signal] connected', socket.id));
 
-      // Important: do NOT create offer on new-peer (prevents glare). Joiner will create offers.
-      socket.on('new-peer', ({ socketId, name }) => {
-        console.log('[signal] new-peer', socketId, name);
-        // addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
-        // Do NOT create tile now. Wait for first ontrack event.
+      // new-peer: populate peerNames and update tile label if present
+      socket.on('new-peer', (payload) => {
+        const socketId = payload && (payload.socketId || payload.id || payload);
+        const name = extractNameFromPayload(payload) || null;
+        if (socketId && name) {
+          peerNames[socketId] = name;
+          updateTileLabelIfExists(socketId);
+        }
+      });
 
+      // room-info: handle possible members list
+      socket.on('room-info', (payload) => {
+        const others = payload && (payload.others || payload.peers || payload.participants || payload.members);
+        if (Array.isArray(others)) {
+          for (const o of others) {
+            if (!o) continue;
+            if (typeof o === 'object') {
+              const id = o.id || o.socketId || o.s || null;
+              const nm = extractNameFromPayload(o);
+              if (id && nm) {
+                peerNames[id] = nm;
+                updateTileLabelIfExists(id);
+              }
+            }
+          }
+        }
       });
 
       socket.on("signal", async ({ from, data }) => {
-    let pc = pcs[from];
-    if (!pc) pc = await createPeerConnection(from, false);
+        if (socket && from === socket.id) return;
+        let pc = pcs[from];
+        if (!pc) pc = await createPeerConnection(from, false);
+        if (!pc) return;
 
-    if (data.type === "offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(data));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("signal", { to: from, from: socket.id, data: answer });
-    }
-    else if (data.type === "answer") {
-        if (!pc.currentRemoteDescription) {
+        if (data.type === "offer") {
             await pc.setRemoteDescription(new RTCSessionDescription(data));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("signal", { to: from, from: socket.id, data: answer });
         }
-    }
-    else if (data.candidate) {
-        if (pc.remoteDescription) {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        else if (data.type === "answer") {
+            if (!pc.currentRemoteDescription) {
+                await pc.setRemoteDescription(new RTCSessionDescription(data));
+            }
         }
-    }
-});
-
+        else if (data.candidate) {
+            if (pc.remoteDescription) {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            }
+        }
+      });
 
       socket.on('peer-left', ({ socketId }) => {
-        console.log('[signal] peer-left', socketId);
         if (pcs[socketId]) { try { pcs[socketId].close(); } catch {} delete pcs[socketId]; }
+        delete peerNames[socketId];
         removeTile(socketId);
       });
     }
 
     async function createPeerConnection(remoteId, initiator) {
-    const pc = new RTCPeerConnection(pcConfig);
-    pcs[remoteId] = pc;
+      if (!remoteId || (socket && remoteId === socket.id)) {
+        return null;
+      }
 
-    // add local tracks
-    if (combinedLocalStream) {
-        combinedLocalStream.getTracks().forEach(t => pc.addTrack(t, combinedLocalStream));
+      const pc = new RTCPeerConnection(pcConfig);
+      pcs[remoteId] = pc;
+
+      if (combinedLocalStream) {
+          combinedLocalStream.getTracks().forEach(t => pc.addTrack(t, combinedLocalStream));
+      }
+
+      pc.ontrack = (ev) => {
+          const incoming = ev.streams && ev.streams[0] ? ev.streams[0] : null;
+          const hasTracks = incoming && ((incoming.getVideoTracks && incoming.getVideoTracks().length) || (incoming.getAudioTracks && incoming.getAudioTracks().length));
+          if (hasTracks) {
+            addOrUpdateTile(remoteId, incoming, peerNames[remoteId] || remoteId, false);
+          } else {
+            let tries = 0;
+            const iv = setInterval(() => {
+              tries++;
+              const s = ev.streams && ev.streams[0] ? ev.streams[0] : null;
+              if (s && ((s.getVideoTracks && s.getVideoTracks().length) || (s.getAudioTracks && s.getAudioTracks().length))) {
+                clearInterval(iv);
+                addOrUpdateTile(remoteId, s, peerNames[remoteId] || remoteId, false);
+              } else if (tries > 10) {
+                clearInterval(iv);
+              }
+            }, 100);
+          }
+      };
+
+      pc.onicecandidate = (ev) => {
+          if (ev.candidate) {
+              socket.emit("signal", { to: remoteId, from: socket.id, data: { candidate: ev.candidate } });
+          }
+      };
+
+      if (initiator) {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          socket.emit("signal", { to: remoteId, from: socket.id, data: offer });
+      }
+
+      return pc;
     }
-
-    pc.ontrack = (ev) => {
-        addOrUpdateTile(remoteId, ev.streams[0], remoteId, false);
-    };
-
-    pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
-            socket.emit("signal", { to: remoteId, from: socket.id, data: { candidate: ev.candidate } });
-        }
-    };
-
-    // only initiator creates offer
-    if (initiator) {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        socket.emit("signal", { to: remoteId, from: socket.id, data: offer });
-    }
-
-    return pc;
-}
-
 
     async function createOfferTo(remoteId) {
-      const pc = await createPeerConnection(remoteId);
+      if (!remoteId || (socket && remoteId === socket.id)) return;
+      const pc = await createPeerConnection(remoteId, true);
+      if (!pc) return;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       socket.emit('signal', { to: remoteId, from: socket.id, data: pc.localDescription });
     }
 
-    // UI actions
+    function waitForPreviewFrame(timeoutMs = 10000) {
+      return new Promise((resolve, reject) => {
+        if (gotFrame) return resolve(true);
+        const start = Date.now();
+        const iv = setInterval(() => {
+          if (gotFrame) {
+            clearInterval(iv);
+            clearTimeout(to);
+            resolve(true);
+          } else if (Date.now() - start > timeoutMs) {
+            clearInterval(iv);
+            reject(new Error('Preview frame timeout'));
+          }
+        }, 200);
+        const to = setTimeout(() => {
+          clearInterval(iv);
+          reject(new Error('Preview frame timeout'));
+        }, timeoutMs);
+      });
+    }
+
+    // create room: auto-start recording + auto join; parse meta/others for names
     createRoomBtn.addEventListener('click', async () => {
       if (!socket) return alert('Signaling unavailable');
       const roomId = (Math.random().toString(36).slice(2,8)).toUpperCase();
       roomInput.value = roomId;
       wireSignalingHandlers();
-      socket.emit('create-room', { roomId, name: nameInput.value }, (res) => {
+      socket.emit('create-room', { roomId, name: nameInput.value }, async (res) => {
         if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not create room');
-        alert('Room created: ' + roomId);
+
+        // server may return meta mapping like { id: name }
+        if (res.meta && typeof res.meta === 'object') {
+          for (const k of Object.keys(res.meta)) {
+            peerNames[k] = res.meta[k];
+            updateTileLabelIfExists(k);
+          }
+        }
+
+        // parse others if present (objects or ids)
+        const others = res.others || res.peers || res.participants || res.members || null;
+        if (Array.isArray(others)) {
+          for (const item of others) {
+            if (!item) continue;
+            if (typeof item === 'object') {
+              const id = item.id || item.socketId || item.s || null;
+              const nm = extractNameFromPayload(item);
+              if (id && nm) {
+                peerNames[id] = nm;
+                updateTileLabelIfExists(id);
+              }
+            }
+          }
+        }
+
+        try {
+          if (vscode) {
+            vscode.postMessage({ command: 'startRecording' });
+          }
+        } catch (e) { console.warn('[create] could not post startRecording', e); }
+
+        try {
+          await waitForPreviewFrame(10000);
+        } catch (err) {
+          alert('Preview/recording did not start in time. Please ensure FFmpeg is available and your camera is connected. Auto-join aborted.');
+          return;
+        }
+
+        try { await ensureAudioPipeline(); } catch (e) { console.warn('[auto-join] ensureAudioPipeline failed', e); }
+
+        socket.emit('join-room', { roomId, name: nameInput.value }, async (joinRes) => {
+          if (!joinRes || !joinRes.ok) {
+            return alert(joinRes && joinRes.message ? joinRes.message : 'Could not join room automatically');
+          }
+          const list = joinRes.others || joinRes.peers || joinRes.participants || joinRes.members || [];
+          // apply meta mapping if present
+          if (joinRes.meta && typeof joinRes.meta === 'object') {
+            for (const k of Object.keys(joinRes.meta)) {
+              peerNames[k] = joinRes.meta[k];
+              updateTileLabelIfExists(k);
+            }
+          }
+          for (const item of list) {
+            if (!item) continue;
+            if (typeof item === 'object') {
+              const id = item.id || item.socketId || item.s || null;
+              const nm = extractNameFromPayload(item);
+              if (id && nm) { peerNames[id] = nm; updateTileLabelIfExists(id); }
+              if (socket && id === socket.id) continue;
+              if (id) await createOfferTo(id);
+            } else {
+              const id = String(item);
+              if (socket && id === socket.id) continue;
+              await createOfferTo(id);
+            }
+          }
+        });
       });
     });
 
+    // join room: flexible parsing
     joinRoomBtn.addEventListener('click', async () => {
       if (!socket) return alert('Signaling unavailable');
       const roomId = (roomInput.value || '').trim().toUpperCase();
       if (!roomId) return alert('Enter room code');
       wireSignalingHandlers();
-      if (!gotFrame) return alert('Start FFmpeg preview first (Turn Camera On) then join the room.');
+      if (!gotFrame) return alert('Start FFmpeg preview/recording first (Turn Camera On or Start Recording) then join the room.');
       await ensureAudioPipeline();
       socket.emit('join-room', { roomId, name: nameInput.value }, async (res) => {
         if (!res || !res.ok) return alert(res && res.message ? res.message : 'Could not join room');
-        const others = res.others || [];
-        for (const id of others) await createOfferTo(id); // JOINER creates offers
+        if (res.meta && typeof res.meta === 'object') {
+          for (const k of Object.keys(res.meta)) {
+            peerNames[k] = res.meta[k];
+            updateTileLabelIfExists(k);
+          }
+        }
+        const others = res.others || res.peers || res.participants || res.members || [];
+        for (const item of others) {
+          if (!item) continue;
+          if (typeof item === 'object') {
+            const id = item.id || item.socketId || item.s || null;
+            const nm = extractNameFromPayload(item);
+            if (id && nm) { peerNames[id] = nm; updateTileLabelIfExists(id); }
+            if (socket && id === socket.id) continue;
+            if (id) await createOfferTo(id);
+          } else {
+            const id = String(item);
+            if (socket && id === socket.id) continue;
+            await createOfferTo(id);
+          }
+        }
       });
     });
 
-    // extension messaging
+    // extension messaging buttons
     turnOnCamBtn.addEventListener('click', () => {
       if (!vscode) return alert('VS Code API unavailable');
       vscode.postMessage({ command: 'turnCameraOn' });
@@ -888,19 +1101,19 @@ function getWebviewContent() {
       const msg = ev.data;
       if (!msg) return;
       if (msg.command === 'frameUpdate' && msg.frame) handleFrameDataURL(msg.frame);
-      else if (msg.command === 'ffmpegLog' && msg.text) { ffmpegLog.textContent += msg.text + "\\n"; ffmpegLog.scrollTop = ffmpegLog.scrollHeight; }
       else if (msg.command === 'requirementsStatus') ffmpegStatus.textContent = msg.ffmpeg ? 'Installed ✓' : 'Missing ✗';
       else if (msg.command === 'audioWsPort') { audioWsPort = msg.port; connectLocalAudioWs(audioWsPort); }
-      else if (msg.command === 'previewStarted') previewPlaceholder.style.display = 'none';
-      else if (msg.command === 'previewStopped') previewPlaceholder.style.display = 'block';
+      else if (msg.command === 'previewStarted') { /* no visible preview UI to update */ }
+      else if (msg.command === 'previewStopped') { /* no visible preview UI to update */ }
       else if (msg.command === 'recordingStarted') { stopRecBtn.disabled = false; startRecBtn.disabled = true; }
       else if (msg.command === 'recordingStopped') { stopRecBtn.disabled = true; startRecBtn.disabled = false; }
+      // ffmpegLog messages intentionally ignored (no visible log)
     });
 
     // initial check
     try { if (vscode) vscode.postMessage({ command: 'checkRequirements' }); } catch (e) {}
 
-    window.__internal = { connectLocalAudioWs, ensureAudioPipeline, createOfferTo, createPeerConnection, pcs, combinedLocalStream };
+    window.__internal = { connectLocalAudioWs, ensureAudioPipeline, createOfferTo, createPeerConnection, pcs, combinedLocalStream, peerNames };
   })();
   </script>
 </body>
