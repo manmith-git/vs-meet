@@ -1,8 +1,8 @@
 {
   "name": "meetup",
   "displayName": "meetup",
-  "description": "VSCode extension with live video and audio recording",
-  "version": "0.0.1",
+  "description": "VSCode extension with live video/audio meeting and collaborative coding",
+  "version": "0.0.2",
   "engines": {
     "vscode": "^1.106.1"
   },
@@ -10,14 +10,19 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:meetup.openRecorder"
+    "onCommand:meetup.openRecorder",
+    "onCommand:webrtcCollab.start"
   ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       {
         "command": "meetup.openRecorder",
-        "title": "Open Camera Recorder"
+        "title": "Open Video/Audio Meet"
+      },
+      {
+        "command": "webrtcCollab.start",
+        "title": "Start Collaborative Coding (WebRTC + Yjs)"
       }
     ],
     "customEditors": [
