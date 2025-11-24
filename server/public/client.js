@@ -86,10 +86,14 @@
     });
 
     socket.on('new-peer', async ({ socketId, name }) => {
-      console.log('new-peer', socketId, name);
-      addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
-      await createOfferTo(socketId);
-    });
+  console.log('new-peer', socketId, name);
+
+  // Create empty tile for this future remote stream
+  addOrUpdateTile(socketId, new MediaStream(), name || 'Guest');
+
+  // DO NOT create offer here — only joiner creates offers
+});
+
 
     socket.on('signal', async ({ from, data }) => {
       if (!pcs[from]) await createPeerConnection(from, false);
