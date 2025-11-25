@@ -240,7 +240,10 @@ function activateMeet(context) {
 
                 previewProcess.stderr.on("data", (d) => {
                   // forward ffmpeg stderr to webview (webview may ignore or log)
-                  panel.webview.postMessage({ command: "ffmpegLog", text: d.toString() });
+                  panel.webview.postMessage({
+                    command: "ffmpegLog",
+                    text: d.toString(),
+                  });
                 });
 
                 previewProcess.on("exit", (code) => {
@@ -393,7 +396,8 @@ function activateMeet(context) {
                       frame: `data:image/jpeg;base64,${base64}`,
                     });
                   }
-                  if (frameBuf.length > 1024 * 1024) frameBuf = Buffer.alloc(0);
+                  if (frameBuf.length > 1024 * 1024)
+                    frameBuf = Buffer.alloc(0);
                 });
 
                 if (previewProcess.stdio && previewProcess.stdio[3]) {
@@ -1430,7 +1434,7 @@ function openCollabPanel(context) {
               forward: true,
             });
 
-            // If I am host, push current editor text into Yjs
+            // If I am host, push current editor text into Yjs (single full-sync)
             if (msg.role === "host" && editor) {
               const full = editor.document.getText();
               collabPanel.webview.postMessage({
@@ -1454,25 +1458,34 @@ function openCollabPanel(context) {
         }
 
         if (msg.type === "editor-change") {
-          // This comes from Yjs (CRDT result) → apply to VS Code editor
+          // This comes from Yjs (CRDT result) → apply to VS Code editor (full text)
           const editor = vscode.window.activeTextEditor;
           if (!editor) return;
-          try {
-            collabApplyingRemote = true;
-            const newText = typeof msg.text === "string" ? msg.text : "";
-            const fullRange = new vscode.Range(
-              editor.document.positionAt(0),
-              editor.document.positionAt(editor.document.getText().length)
-            );
-            editor.edit((ed) => {
+
+          const newText = typeof msg.text === "string" ? msg.text : "";
+          const currentText = editor.document.getText();
+          if (currentText === newText) {
+            return;
+          }
+
+          collabApplyingRemote = true;
+          const fullRange = new vscode.Range(
+            editor.document.positionAt(0),
+            editor.document.positionAt(currentText.length)
+          );
+
+          editor
+            .edit((ed) => {
               ed.replace(fullRange, newText);
-            }).then(() => {
+            })
+            .then(() => {
               // Autosave after remote/Yjs-driven changes
               collabScheduleAutosave(editor.document);
+            })
+            .finally(() => {
+              collabApplyingRemote = false;
             });
-          } finally {
-            collabApplyingRemote = false;
-          }
+
           return;
         }
 
@@ -1517,19 +1530,22 @@ function openCollabPanel(context) {
       let lastCursorSentTime = 0;
       let lastCursorOffset = -1;
 
-      // Local VS Code edits → push into Yjs (webview), but avoid loops
+      // Local VS Code edits → push into Yjs (webview) as deltas, but avoid loops
       const send = vscode.workspace.onDidChangeTextDocument((ev) => {
         if (!collabPanel || collabApplyingRemote) return;
         const editor = vscode.window.activeTextEditor;
         if (!editor || ev.document !== editor.document) return;
 
-        const full = ev.document.getText();
-        collabPanel.webview.postMessage({
-          type: "editor-change",
-          text: full,
-          forward: true, // Yjs will broadcast to peers
-          source: "vscode",
-        });
+        for (const change of ev.contentChanges) {
+          collabPanel.webview.postMessage({
+            type: "editor-delta",
+            offset: change.rangeOffset,
+            removed: change.rangeLength,
+            inserted: change.text,
+            forward: true, // Yjs will broadcast to peers
+            source: "vscode",
+          });
+        }
       });
 
       collabSubs.push(send);
@@ -2062,17 +2078,37 @@ window.addEventListener("message", ev => {
     try { dc.send(JSON.stringify(m)); } catch {}
   }
 
+  // Initial full sync from VS Code (host on dc-open)
   if (m.type === "editor-change" && typeof m.text === "string") {
-    // Avoid echo loops: only update Yjs if text actually differs
     const current = ytext.toString();
     if (current === m.text) return;
 
+    isApplyingRemoteY = true;
     ydoc.transact(() => {
       try { ytext.delete(0, ytext.length); } catch {}
       ytext.insert(0, m.text);
     });
+    isApplyingRemoteY = false;
 
     lastTextSentFromY = m.text;
+    return;
+  }
+
+  // Incremental local edits from VS Code → apply as Yjs deltas
+  if (m.type === "editor-delta") {
+    const offset = typeof m.offset === "number" ? m.offset : 0;
+    const removed = typeof m.removed === "number" ? m.removed : 0;
+    const inserted = typeof m.inserted === "string" ? m.inserted : "";
+
+    ydoc.transact(() => {
+      if (removed > 0) {
+        try { ytext.delete(offset, removed); } catch {}
+      }
+      if (inserted && inserted.length) {
+        try { ytext.insert(offset, inserted); } catch {}
+      }
+    });
+    return;
   }
 });
 
