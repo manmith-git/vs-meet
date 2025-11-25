@@ -2144,10 +2144,41 @@ log("Ready. Yjs loaded & WebRTC idle");
    Combined activation & deactivation
    --------------------------- */
 
+/* ---------------------------
+   Combined activation & deactivation
+   --------------------------- */
+
 function activate(context) {
-  // initialize both features
+
+  // activate both features
   activateMeet(context);
   activateCollab(context);
+
+  // ------------------------------------
+  // STATUS BAR BUTTON: MEET (Video/Audio)
+  // ------------------------------------
+  const meetButton = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    100
+  );
+  meetButton.text = `$(device-camera-video) Meet`;
+  meetButton.tooltip = "Open VS Meet (Video + Audio)";
+  meetButton.command = "meetup.openRecorder";
+  meetButton.show();
+  context.subscriptions.push(meetButton);
+
+  // ------------------------------------
+  // STATUS BAR BUTTON: COLLAB
+  // ------------------------------------
+  const collabButton = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    99
+  );
+  collabButton.text = `$(group-by-ref-type) Collaborate`;
+  collabButton.tooltip = "Open Collaborative Coding Panel";
+  collabButton.command = "webrtcCollab.start";
+  collabButton.show();
+  context.subscriptions.push(collabButton);
 }
 
 function deactivate() {
