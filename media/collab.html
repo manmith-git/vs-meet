@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src ${cspSource}; style-src 'unsafe-inline' ${cspSource}; script-src 'unsafe-inline' ${cspSource}; connect-src ws: wss: https:;">
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>WebRTC Collab (Yjs)</title>
+
+<style>
+  /* styles omitted for brevity (same as before) */
+  body{font-family:Segoe UI,Arial,system-ui;margin:0;padding:0;background:#1e1e1e;color:#e5e5e5}
+  .container{padding:16px;max-width:780px;margin:auto}
+  .card{background:#252526;padding:14px 18px;border-radius:8px;margin-bottom:18px;border:1px solid #3a3a3a}
+  .row{display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  input{background:#333;border:1px solid #555;color:#fff;padding:8px;border-radius:6px}
+  button{background:#0e639c;border:none;color:#fff;padding:7px 14px;border-radius:6px;cursor:pointer;font-weight:500}
+  button:hover{background:#1177bb} button:disabled{background:#666;cursor:not-allowed}
+  #users{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .user{padding:5px 10px;border-radius:14px;font-size:13px;color:black;font-weight:600;display:flex;align-items:center;opacity:0.9;transition:0.15s}
+  .user.active{transform:scale(1.06);opacity:1}
+  #log{background:#111;padding:10px;border-radius:6px;height:140px;overflow-y:auto;font-size:12px;border:1px solid #333}
+  .section-title{font-size:14px;font-weight:bold;margin-bottom:6px;opacity:0.9}
+  .btn-secondary{background:#444!important}
+  .btn-secondary:hover{background:#555!important}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+  <h2>⚡ Real-time Collaborative Coding</h2>
+
+  <div class="card">
+    <div class="section-title">Session Room</div>
+    <div class="row">
+      <input id="room" value="DEFAULT_ROOM_PLACEHOLDER" style="flex:1" />
+      <button class="btn-secondary" id="regen">New</button>
+      <button class="btn-secondary" id="copy">Copy</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Your Profile</div>
+    <div class="row">
+      <label style="min-width:80px;">Color:</label>
+      <input id="color" type="color" value="#ff79c6" style="width:50px;padding:0;">
+      <button id="applyProfile">Apply</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Connection</div>
+    <div class="row">
+      <button id="host" style="flex:1;">Host Session</button>
+      <button id="join" style="flex:1;">Join Session</button>
+      <button id="disc" disabled style="flex:1;" class="btn-secondary">Disconnect</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Connected Users</div>
+    <div id="users"></div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Logs</div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<!-- Yjs and collab.js are injected via panel.js as webview URIs -->
+<script src="YJS_URI"></script>
+<script src="COLLAB_JS_URI"></script>
+
+</body>
+</html>
